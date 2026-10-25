@@ -137,7 +137,6 @@ type Probe struct {
 	PathVerified      bool   `json:"path_verified"`
 	Revoked           bool   `json:"revoked"`
 	HasToken          bool   `json:"has_token"`
-	EnrollmentExpires int64  `json:"enrollment_expires,omitempty"`
 }
 type Observation struct {
 	Platform  string `json:"platform"`

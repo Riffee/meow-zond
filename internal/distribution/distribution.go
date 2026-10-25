@@ -12,13 +12,12 @@ import (
 var magic = []byte("\x00MEOWPROBE-DISTRIBUTION-V1\x00")
 
 type Config struct {
-	Server          string `json:"server"`
-	RegistrationKey string `json:"registration_key"`
+	Server string `json:"server"`
 }
 
 func Encode(base []byte, c Config) ([]byte, error) {
-	if c.Server == "" || c.RegistrationKey == "" {
-		return nil, fmt.Errorf("distribution server and registration key are required")
+	if c.Server == "" {
+		return nil, fmt.Errorf("distribution server is required")
 	}
 	payload, err := json.Marshal(c)
 	if err != nil {
@@ -52,7 +51,7 @@ func Decode(data []byte) (Config, bool) {
 	if size <= 0 || size > 8192 || payload+size != len(data) {
 		return c, false
 	}
-	if json.Unmarshal(data[payload:payload+size], &c) != nil || c.Server == "" || c.RegistrationKey == "" {
+	if json.Unmarshal(data[payload:payload+size], &c) != nil || c.Server == "" {
 		return Config{}, false
 	}
 	return c, true

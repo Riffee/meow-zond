@@ -1,50 +1,36 @@
 #!/usr/bin/env bash
 set -euo pipefail
-cd "$(dirname "$0")"
 
-usage() {
-  cat <<'EOF'
-Запуск зонда meow-zond в Docker.
+REPO_URL="${MEOW_REPO_URL:-https://github.com/Riffee/meow-zond.git}"
+TARGET="${MEOW_DIR:-/opt/meow-zond}"
+TTY=/dev/tty
 
-  ./install.sh --server https://status.example.com --code ABCD-EFGH-JKLM --name "Server zond"
-
-Код подключения создаётся в админке: Зонды → + Зонд. Он одноразовый.
-После первой регистрации конфигурация хранится в volume meow-zond-data,
-и повторный запуск продолжает работу с тем же зондом.
-
-Параметры также можно задать через MEOW_SERVER, MEOW_CODE, MEOW_PROBE_NAME.
-EOF
+die() {
+  echo "Ошибка: $*" >&2
+  exit 1
 }
 
-server="${MEOW_SERVER:-}"
-code="${MEOW_CODE:-}"
-name="${MEOW_PROBE_NAME:-}"
+have_tty() {
+  [[ -r "$TTY" ]]
+}
 
-while (($#)); do
-  case "$1" in
-    --server)
-      server="${2:-}"
-      shift 2
-      ;;
-    --code)
-      code="${2:-}"
-      shift 2
-      ;;
-    --name)
-      name="${2:-}"
-      shift 2
-      ;;
-    -h|--help)
-      usage
-      exit 0
-      ;;
-    *)
-      echo "Неизвестный аргумент: $1" >&2
-      usage >&2
-      exit 1
-      ;;
-  esac
-done
+ask() {
+  local prompt="$1" default="${2:-}" value=""
+  if have_tty; then
+    printf '%s%s: ' "$prompt" "${default:+ [$default]}" >&2
+    IFS= read -r value < "$TTY" || true
+  fi
+  printf '%s' "${value:-$default}"
+}
+
+confirm() {
+  local answer=""
+  if have_tty; then
+    printf '%s [Y/n]: ' "$1" >&2
+    IFS= read -r answer < "$TTY" || true
+  fi
+  [[ -z "$answer" || "$answer" =~ ^[YyДд] ]]
+}
 
 env_value() {
   local key="$1" line
@@ -59,70 +45,84 @@ env_value() {
   printf '%s' "$line"
 }
 
-if [[ -f .env ]]; then
-  [[ -z "$server" ]] && server="$(env_value MEOW_SERVER)"
-  [[ -z "$code" ]] && code="$(env_value MEOW_CODE)"
-  [[ -z "$name" ]] && name="$(env_value MEOW_PROBE_NAME)"
-fi
+[[ "$(id -u)" -eq 0 ]] || die "запустите установщик через sudo"
 
-if [[ -z "$server" && -t 0 ]]; then
-  read -rp "Адрес статус-страницы (https://...): " server
+script_dir=""
+if [[ -n "${BASH_SOURCE[0]:-}" ]]; then
+  script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd || true)"
 fi
-if [[ -z "$code" && -t 0 ]]; then
-  read -rsp "Одноразовый код из админки: " code
-  echo
-fi
-if [[ -z "$name" ]]; then
-  if [[ -t 0 ]]; then
-    read -rp "Имя зонда [meow-zond]: " name
+if [[ -n "$script_dir" && -f "$script_dir/compose.yaml" && -f "$script_dir/Dockerfile" ]]; then
+  TARGET="$script_dir"
+else
+  if ! command -v git >/dev/null 2>&1; then
+    if command -v apt-get >/dev/null 2>&1; then
+      echo "Устанавливаю git…"
+      apt-get update -qq
+      DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git
+    else
+      die "не найден git; установите git и повторите"
+    fi
   fi
-  name="${name:-meow-zond}"
+  if [[ -d "$TARGET/.git" ]]; then
+    echo "Обновляю $TARGET…"
+    git -C "$TARGET" pull --ff-only
+  elif [[ -e "$TARGET" ]]; then
+    die "$TARGET уже существует и не является git-репозиторием; выберите MEOW_DIR или уберите каталог"
+  else
+    mkdir -p "$(dirname "$TARGET")"
+    echo "Клонирую $REPO_URL в $TARGET…"
+    git clone --depth 1 "$REPO_URL" "$TARGET"
+  fi
+fi
+cd "$TARGET"
+
+if ! command -v docker >/dev/null 2>&1; then
+  if command -v apt-get >/dev/null 2>&1 && confirm "Docker не найден. Установить Docker Engine через get.docker.com?"; then
+    curl -fsSL https://get.docker.com | sh
+    systemctl enable --now docker >/dev/null 2>&1 || true
+  else
+    die "установите Docker и Docker Compose V2, затем повторите"
+  fi
+fi
+if ! docker compose version >/dev/null 2>&1; then
+  if command -v apt-get >/dev/null 2>&1; then
+    echo "Устанавливаю Docker Compose plugin…"
+    apt-get update -qq || true
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq docker-compose-plugin || true
+  fi
+fi
+docker compose version >/dev/null 2>&1 || die "нужен Docker Compose V2 (docker compose)"
+docker info >/dev/null 2>&1 || die "Docker daemon недоступен"
+
+server="${MEOW_SERVER:-}"
+name="${MEOW_PROBE_NAME:-}"
+if [[ -f .env ]]; then
+  [[ -n "$server" ]] || server="$(env_value MEOW_SERVER)"
+  [[ -n "$name" ]] || name="$(env_value MEOW_PROBE_NAME)"
 fi
 
-if [[ -z "$server" || -z "$code" ]]; then
-  echo "Нужны --server и --code. Код создаётся в админке: Зонды → + Зонд." >&2
-  exit 1
+[[ -n "$server" ]] || server="$(ask "Адрес статус-страницы (https://...)" "")"
+if [[ -z "$name" ]]; then
+  host_default="$(hostname -s 2>/dev/null || echo server)"
+  name="$(ask "Имя зонда" "meow-zond-$host_default")"
 fi
+
+server="$(printf '%s' "$server" | tr -d '\r\n')"
+name="$(printf '%s' "$name" | tr -d '\r\n')"
 case "$server" in
   https://*|http://*) ;;
-  *)
-    echo "Адрес должен начинаться с https:// (http:// только для локальной отладки)." >&2
-    exit 1
-    ;;
+  *) die "адрес должен начинаться с https:// (http:// только для локальной отладки)" ;;
 esac
-if [[ "$server" =~ [[:space:]] || "$code" =~ [[:space:]] ]]; then
-  echo "Адрес и код не должны содержать пробелы." >&2
-  exit 1
-fi
-code="$(printf '%s' "$code" | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]')"
-if [[ ${#name} -gt 100 || "$name" == *"'"* || "$name" == *$'\n'* || "$name" == *$'\r'* ]]; then
-  echo "Имя зонда: до 100 символов, без одинарных кавычек и переводов строк." >&2
-  exit 1
-fi
-
-command -v docker >/dev/null 2>&1 || {
-  echo "Docker не установлен." >&2
-  exit 1
-}
-docker compose version >/dev/null 2>&1 || {
-  echo "Нужен Docker Compose V2 (команда docker compose)." >&2
-  exit 1
-}
-docker info >/dev/null 2>&1 || {
-  echo "Docker daemon недоступен. Запустите Docker или выполните установку через sudo." >&2
-  exit 1
-}
+[[ "$server" != *[[:space:]]* ]] || die "адрес не должен содержать пробелы"
+[[ ${#name} -le 100 && "$name" != *"'"* ]] || die "имя: до 100 символов и без одинарной кавычки"
 
 case "$server" in
-  http://*)
-    echo "Внимание: HTTP без шифрования допустим только для локальной отладки." >&2
-    ;;
+  http://*) echo "Внимание: HTTP без шифрования допустим только для локальной отладки." >&2 ;;
 esac
 
 umask 077
 {
   printf 'MEOW_SERVER=%s\n' "$server"
-  printf 'MEOW_CODE=%s\n' "$code"
   printf "MEOW_PROBE_NAME='%s'\n" "$name"
 } > .env
 chmod 600 .env

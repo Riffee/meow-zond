@@ -10,7 +10,6 @@ services:
     network_mode: host
     environment:
       MEOW_SERVER: ${MEOW_SERVER:-}
-      MEOW_CODE: ${MEOW_CODE:-}
       MEOW_PROBE_NAME: ${MEOW_PROBE_NAME:-meow-zond}
     volumes:
       - meow-zond-data:/data

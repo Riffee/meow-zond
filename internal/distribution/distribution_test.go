@@ -4,7 +4,7 @@ import "testing"
 
 func TestRoundTrip(t *testing.T) {
 	base := []byte("MZ fake executable payload")
-	want := Config{Server: "https://status.example.com", RegistrationKey: "secret-key"}
+	want := Config{Server: "https://status.example.com"}
 	data, err := Encode(base, want)
 	if err != nil {
 		t.Fatal(err)

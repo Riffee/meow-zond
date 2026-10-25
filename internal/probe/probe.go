@@ -128,63 +128,7 @@ func Save(path string, c Config) error {
 	return os.Rename(tmp, path)
 }
 
-func Enroll(ctx context.Context, server, code string) (Config, error) {
-	var c Config
-	server = strings.TrimRight(strings.TrimSpace(server), "/")
-	dev := DevelopmentServer(server)
-	if !serverURLAllowed(server, dev) {
-		return c, fmt.Errorf("укажите адрес статус-страницы, например https://status.example.com")
-	}
-	u, e := url.Parse(server)
-	if e != nil || u.Host == "" || (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" {
-		return c, fmt.Errorf("адрес должен содержать только схему и домен, без /api и параметров")
-	}
-	body, _ := json.Marshal(map[string]string{"code": strings.TrimSpace(code), "platform": runtime.GOOS + "/" + runtime.GOARCH})
-	reqCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
-	defer cancel()
-	req, e := http.NewRequestWithContext(reqCtx, "POST", server+"/api/probe/enroll", bytes.NewReader(body))
-	if e != nil {
-		return c, e
-	}
-	req.Header.Set("Content-Type", "application/json")
-	client := directClient(20 * time.Second)
-	defer client.CloseIdleConnections()
-	resp, e := client.Do(req)
-	if e != nil {
-		return c, fmt.Errorf("не удалось связаться со статус-страницей: проверьте адрес и интернет")
-	}
-	defer resp.Body.Close()
-	var out struct {
-		ProbeID   string `json:"probe_id"`
-		ProbeName string `json:"probe_name"`
-		Token     string `json:"token"`
-		Error     string `json:"error"`
-	}
-	if json.NewDecoder(io.LimitReader(resp.Body, 8192)).Decode(&out) != nil {
-		return c, fmt.Errorf("сервер вернул неожиданный ответ (HTTP %d)", resp.StatusCode)
-	}
-	if resp.StatusCode != http.StatusOK {
-		if out.Error == "" {
-			out.Error = fmt.Sprintf("сервер отклонил подключение (HTTP %d)", resp.StatusCode)
-		}
-		return c, fmt.Errorf("%s", out.Error)
-	}
-	if out.ProbeID == "" || len(out.Token) < 32 {
-		return c, fmt.Errorf("сервер не выдал доступ для зонда")
-	}
-	c = Config{
-		Server:       server,
-		ProbeID:      out.ProbeID,
-		ProbeName:    out.ProbeName,
-		Token:        out.Token,
-		Development:  dev,
-		Controls:     DefaultControls(),
-		IdentityURLs: DefaultIdentityURLs(),
-	}
-	return c, nil
-}
-
-func Register(ctx context.Context, server, key, name string) (Config, error) {
+func Register(ctx context.Context, server, name string) (Config, error) {
 	var c Config
 	name = strings.TrimSpace(name)
 	if name == "" || len(name) > 100 {
@@ -199,7 +143,7 @@ func Register(ctx context.Context, server, key, name string) (Config, error) {
 	if e != nil || u.Host == "" || (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" {
 		return c, fmt.Errorf("в программе указан некорректный адрес статус-страницы")
 	}
-	body, _ := json.Marshal(map[string]string{"name": name, "key": key, "platform": runtime.GOOS + "/" + runtime.GOARCH})
+	body, _ := json.Marshal(map[string]string{"name": name, "platform": runtime.GOOS + "/" + runtime.GOARCH})
 	reqCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 	req, e := http.NewRequestWithContext(reqCtx, "POST", server+"/api/probe/register", bytes.NewReader(body))

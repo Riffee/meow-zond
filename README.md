@@ -1,94 +1,109 @@
-# meow-zond
+<div align="center">
+  <img src="assets/logo.png" alt="meow-zond" width="180">
+  <h1>meow-zond</h1>
+  <p>Self-hosted Docker probe for meow! status — real network, web and VPN checks from your own network.</p>
+  <p>
+    <img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="MIT License">
+    <img src="https://img.shields.io/badge/Language-Bash-4EAA25.svg?logo=gnu-bash&logoColor=white" alt="Bash">
+    <img src="https://img.shields.io/badge/Tech-Docker-2496ED.svg?logo=docker&logoColor=white" alt="Docker">
+    <img src="https://img.shields.io/badge/Release-v1.0.0-blueviolet.svg" alt="Version">
+  </p>
+  <p><strong>English</strong> / <a href="README.ru.md">Русский</a></p>
+</div>
 
-Открытый агент внешних проверок для meow! status. Запускается в
-Docker-контейнере `meow-zond`, выполняет TCP, ICMP, HTTP, DNS, TLS и
-VPN end-to-end проверки и отправляет результаты на статус-страницу.
-
-## Быстрый старт на Linux-сервере
-
-1. В админке откройте **Зонды → + Зонд**, задайте имя и скопируйте одноразовый
-   код подключения.
-2. Склонируйте репозиторий и запустите установщик:
+## Install with one command
 
 ```bash
-sudo bash -c 'git clone https://github.com/Riffee/meow-zond.git /opt/meow-zond \
-  && cd /opt/meow-zond \
-  && ./install.sh --server https://status.example.com --code ABCD-EFGH-JKLM --name "Server zond"'
+curl -fsSL https://raw.githubusercontent.com/Riffee/meow-zond/main/install.sh | sudo bash
 ```
 
-Без аргументов установщик спросит адрес, код и имя. Параметры можно передать
-переменными `MEOW_SERVER`, `MEOW_CODE`, `MEOW_PROBE_NAME`.
+The installer clones the repository into `/opt/meow-zond`, installs Docker if
+needed, asks for your status page URL and a probe name, then builds and starts
+the `meow-zond` container. No pairing codes or registration keys.
 
-Установщик собирает образ, запускает контейнер `meow-zond` и пишет `.env`
-с правами `0600`. Код подключения одноразовый: после регистрации зонд хранит
-свою конфигурацию в volume `meow-zond-data` и перезапускается без повторного
-кода.
+Script: [install.sh](https://raw.githubusercontent.com/Riffee/meow-zond/main/install.sh)
 
-## Требования
+## Open registration
 
-- Linux-хост с Docker и Docker Compose V2.
-- `network_mode: host`: проверки и определение сети должны идти через
-  физическую сеть хоста.
-- `NET_RAW` для ICMP и привязки к интерфейсу. Остальные capabilities сброшены,
-  корневая ФС контейнера read-only, запись разрешена только в `/data` и `/tmp`.
-- Для VPN end-to-end нужен отдельно проверенный Xray; в репозиторий и образ
-  он не входит. Укажите `xray_path` и `xray_sha256` в `/data/probe.json`.
+Anyone who can reach the status page can register a probe by name. This is
+intentional: probes are independent measurement points, not privileged users.
+Registration is rate-limited and capped; the administrator decides which probes
+are assigned to monitors and can delete unwanted probes.
 
-## Логи
+## What it does
+
+- Runs TCP, ICMP, HTTP, DNS and TLS checks from the probe network.
+- Supports optional Xray/VLESS/REALITY end-to-end checks. Xray is not bundled;
+  point `xray_path` and `xray_sha256` in `/data/probe.json` to a verified binary.
+- Sends only outbound HTTPS requests to the status page. No inbound ports.
+- Uses `network_mode: host` so checks and network detection use the host's real
+  internet path. ICMP and interface binding use `NET_RAW`; other capabilities
+  are dropped and the container filesystem is read-only.
+- Keeps the probe identity, spool and settings in the `meow-zond-data` volume.
+
+## Logs
 
 ```bash
 docker compose logs -f meow-zond
 docker compose exec meow-zond tail -n 500 /data/probe.log
 ```
 
-Каждая проверка пишет одну строку: имя монитора, тип, цель, результат,
-этап ошибки и задержку. Секреты, VLESS UUID и Reality-параметры не логируются.
+Every check logs the monitor name, check type, target, outcome, failure stage
+and latency. Secrets, VLESS UUIDs and Reality parameters are never logged.
 
-- `/data/probe.log` — кольцевой буфер ровно на **500 последних строк**;
-- Docker JSON-лог ограничен **64 КБ и одним файлом** (`max-size`, `max-file`).
+- `/data/probe.log` is a ring buffer of exactly the last **500** lines;
+- the Docker JSON log is capped at **64 KB** in one rotated file.
 
-Обе копии ограничены, поэтому логи не растут бесконечно.
+## Requirements
 
-## Обновление и повторная регистрация
+- Linux host with root/sudo.
+- Docker Engine and Docker Compose V2. The installer offers to install Docker.
+- Outbound internet access and HTTPS access to the status page.
+
+## Update or reinstall
 
 ```bash
-# обновить исходники и пересобрать контейнер
+cd /opt/meow-zond
 git pull
 docker compose up -d --build
-
-# удалить конфигурацию и зарегистрировать заново
-docker compose down -v
-./install.sh --server https://status.example.com --code NEW-CODE --name "Server zond"
 ```
 
-`docker compose down` без `-v` сохраняет конфигурацию и историю зонда.
+Reset the probe configuration and register again:
 
-## Безопасность
+```bash
+cd /opt/meow-zond
+docker compose down -v
+./install.sh
+```
 
-- `.env` содержит одноразовый код и не должен попадать в Git — он уже в
-  `.gitignore`; не публикуйте файл.
-- Контейнер не требует входящих портов и публичного доступа.
-- HTTP-адрес сервера разрешён только для локальной отладки, в production
-  используйте HTTPS.
-- Установщик проверяет только адрес и код; Xray и тестовые VPN-профили
-  настраиваются отдельно.
+`docker compose down` without `-v` keeps the volume and probe identity.
 
-## Структура
+## Security
+
+- The probe only receives typed check tasks and returns results; it never gets
+  admin credentials or the Remnawave token.
+- Open registration means a new probe can appear without prior approval. Keep
+  the status page URL private if you do not want public probes, or remove
+  unwanted probes from the admin panel.
+- Use HTTPS for the status page in production. HTTP is accepted only for local
+  development.
+
+## Source layout
 
 ```text
-cmd/meow-zond      консольный/headless агент и Windows-служба
-internal/probe     сетевые проверки, Xray и кольцевой spool
-internal/model     общие типы монитора, задания и результата
-internal/secure    идентификаторы и хеши
-internal/distribution  встроенная конфигурация для скачиваемых сборок
+cmd/meow-zond          console/headless agent and Windows service
+internal/probe         network checks, Xray runner and spool
+internal/model         shared monitor, task and result types
+internal/secure        identifiers and hashes
+internal/distribution  embedded server configuration for downloaded builds
 ```
 
-Тесты:
+Tests:
 
 ```bash
 go test ./...
 ```
 
-## Лицензия
+## License
 
-MIT. См. [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).

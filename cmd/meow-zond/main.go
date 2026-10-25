@@ -25,37 +25,36 @@ func main() {
 	initUI()
 	configPath := flag.String("config", defaultConfigPath(), "путь к файлу настроек зонда")
 	server := flag.String("server", os.Getenv("MEOW_SERVER"), "адрес статус-страницы для подключения")
-	code := flag.String("code", os.Getenv("MEOW_CODE"), "одноразовый код подключения из админки")
-	name := flag.String("name", os.Getenv("MEOW_PROBE_NAME"), "имя зонда для неинтерактивной самрегистрации")
+	name := flag.String("name", os.Getenv("MEOW_PROBE_NAME"), "имя зонда для автоматической регистрации")
 	headless := flag.Bool("headless", false, "работать без консольного меню")
 	installService := flag.Bool("install-service", false, "установить фоновую службу Windows")
 	uninstallService := flag.Bool("uninstall-service", false, "удалить фоновую службу Windows")
 	flag.Usage = func() {
 		fmt.Fprintln(os.Stderr, "Запуск без параметров: мастер подключения и меню включения.")
-		fmt.Fprintln(os.Stderr, "Подключение по коду: meow-probe -server https://status.example.com -code ABCD-EFGH-JKLM")
-		fmt.Fprintln(os.Stderr, "Docker/headless: MEOW_PROBE_NAME=... meow-probe -headless -config /data/probe.json")
+		fmt.Fprintln(os.Stderr, "Адрес и имя: meow-zond -server https://status.example.com -name \"Server zond\"")
+		fmt.Fprintln(os.Stderr, "Docker/headless: MEOW_SERVER=... MEOW_PROBE_NAME=... meow-zond -headless -config /data/probe.json")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
 	forceEnroll := false
 	flag.Visit(func(f *flag.Flag) {
-		if f.Name == "server" || f.Name == "code" {
+		if f.Name == "server" || f.Name == "name" {
 			forceEnroll = true
 		}
 	})
-	if e := safeRun(*configPath, *server, *code, *name, forceEnroll, *headless, *installService, *uninstallService); e != nil {
+	if e := safeRun(*configPath, *server, *name, forceEnroll, *headless, *installService, *uninstallService); e != nil {
 		reportFatal(e, *configPath)
 		os.Exit(1)
 	}
 }
 
-func safeRun(configPath, server, code, name string, forceEnroll, headless, installService, uninstallService bool) (err error) {
+func safeRun(configPath, server, name string, forceEnroll, headless, installService, uninstallService bool) (err error) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			err = fmt.Errorf("внутренняя ошибка: %v\n%s", recovered, debug.Stack())
 		}
 	}()
-	return run(configPath, server, code, name, forceEnroll, headless, installService, uninstallService)
+	return run(configPath, server, name, forceEnroll, headless, installService, uninstallService)
 }
 
 func reportFatal(err error, configPath string) {
@@ -98,30 +97,61 @@ func defaultConfigPath() string {
 	return filepath.Join(appDataDir(), "probe.json")
 }
 
-func run(configPath, server, code, name string, forceEnroll, headless, installService, uninstallService bool) error {
+func run(configPath, server, name string, forceEnroll, headless, installService, uninstallService bool) error {
 	if installService && uninstallService {
 		return errors.New("нельзя одновременно установить и удалить службу")
 	}
 	if uninstallService {
 		return uninstallWindowsService()
 	}
-	if (server == "") != (code == "") {
-		return errors.New("укажите и адрес статус-страницы (-server), и код подключения (-code)")
-	}
 	var input *bufio.Reader
 	if interactive() {
 		input = bufio.NewReader(os.Stdin)
 	}
 	c, loadErr := probe.Load(configPath)
-	if server != "" && (forceEnroll || loadErr != nil) {
+	if forceEnroll || loadErr != nil {
 		if loadErr != nil && !errors.Is(loadErr, os.ErrNotExist) {
 			fmt.Fprintln(os.Stderr, "Текущая настройка зонда будет заменена.")
+		}
+		embedded, hasEmbedded := distribution.ReadExecutable()
+		if strings.TrimSpace(server) == "" && hasEmbedded {
+			server = embedded.Server
+		}
+		server = strings.TrimSpace(server)
+		name = strings.TrimSpace(name)
+		if server == "" {
+			if input == nil {
+				return errors.New("укажите адрес статус-страницы: -server или MEOW_SERVER")
+			}
+			fmt.Print("\n  " + paint(ansiBold, "Адрес статус-страницы: "))
+			var e error
+			if server, e = readLine(input); e != nil {
+				return e
+			}
+			server = strings.TrimSpace(server)
+		}
+		if name == "" {
+			if input == nil {
+				return errors.New("укажите имя зонда: -name или MEOW_PROBE_NAME")
+			}
+			fmt.Print("\n  " + paint(ansiBold, "Как вас подписать в панели: "))
+			var e error
+			if name, e = readLine(input); e != nil {
+				return e
+			}
+			name = strings.TrimSpace(name)
+		}
+		if server == "" {
+			return errors.New("адрес статус-страницы не указан")
+		}
+		if name == "" {
+			return errors.New("имя зонда не указано")
 		}
 		if strings.HasPrefix(strings.ToLower(server), "http://") {
 			fmt.Fprintln(os.Stderr, "Внимание: HTTP без шифрования допустим только для локальной отладки.")
 		}
 		var e error
-		c, e = probe.Enroll(context.Background(), server, code)
+		c, e = probe.Register(context.Background(), server, name)
 		if e != nil {
 			return e
 		}
@@ -129,45 +159,7 @@ func run(configPath, server, code, name string, forceEnroll, headless, installSe
 		if e = probe.Save(configPath, c); e != nil {
 			return fmt.Errorf("не удалось сохранить настройки: %w", e)
 		}
-		fmt.Printf("Зонд «%s» подключён.\n", displayName(c))
-		fmt.Println("IP, страна, провайдер и ASN определятся автоматически.")
-	} else if loadErr != nil {
-		if !errors.Is(loadErr, os.ErrNotExist) {
-			return fmt.Errorf("не удалось прочитать настройки: %w", loadErr)
-		}
-		embedded, hasEmbedded := distribution.ReadExecutable()
-		name = strings.TrimSpace(name)
-		switch {
-		case hasEmbedded && name != "":
-			var e error
-			c, e = probe.Register(context.Background(), embedded.Server, embedded.RegistrationKey, name)
-			if e != nil {
-				return e
-			}
-			c.Spool = filepath.Join(filepath.Dir(configPath), "probe-results.json")
-			if e = probe.Save(configPath, c); e != nil {
-				return fmt.Errorf("не удалось сохранить настройки: %w", e)
-			}
-			fmt.Printf("Зонд «%s» подключён. Настройки: %s\n", displayName(c), configPath)
-		case interactive() && input != nil:
-			if hasEmbedded {
-				c, loadErr = setupRegistered(input, embedded)
-			} else {
-				c, loadErr = setupWizard(input)
-			}
-			if loadErr != nil {
-				return loadErr
-			}
-			c.Spool = filepath.Join(filepath.Dir(configPath), "probe-results.json")
-			if e := probe.Save(configPath, c); e != nil {
-				return fmt.Errorf("не удалось сохранить настройки: %w", e)
-			}
-			fmt.Printf("Зонд «%s» подключён. Настройки: %s\n", displayName(c), configPath)
-		case hasEmbedded:
-			return errors.New("зонд ещё не настроен; задайте имя через -name или MEOW_PROBE_NAME")
-		default:
-			return errors.New("зонд ещё не настроен; запустите его в консоли или укажите -server и -code")
-		}
+		fmt.Printf("Зонд «%s» подключён. Настройки: %s\n", displayName(c), configPath)
 	}
 
 	if handled, e := runService(c); handled {
@@ -200,56 +192,6 @@ func run(configPath, server, code, name string, forceEnroll, headless, installSe
 		return runHeadless(c)
 	}
 	return console(configPath, c, input)
-}
-
-func setupRegistered(input *bufio.Reader, embedded distribution.Config) (probe.Config, error) {
-	fmt.Println(paint(ansiMagenta, "meow! probe") + paint(ansiMuted, ": подключение"))
-	fmt.Println("Программа уже настроена на вашу статус-страницу.")
-	fmt.Println(paint(ansiMuted, embedded.Server))
-	if strings.HasPrefix(strings.ToLower(embedded.Server), "http://") {
-		fmt.Println(paint(ansiYellow, "Внимание: HTTP без шифрования допустим только для локальной отладки."))
-	}
-	for {
-		fmt.Print("\n  " + paint(ansiBold, "Как вас подписать в панели: "))
-		name, e := readLine(input)
-		if e != nil {
-			return probe.Config{}, e
-		}
-		c, e := probe.Register(context.Background(), embedded.Server, embedded.RegistrationKey, name)
-		if e != nil {
-			fmt.Println(paint(ansiRed, "Не получилось: "+e.Error()))
-			fmt.Println(paint(ansiMuted, "Проверьте интернет и попробуйте ввести имя ещё раз."))
-			continue
-		}
-		return c, nil
-	}
-}
-
-func setupWizard(input *bufio.Reader) (probe.Config, error) {
-	fmt.Println(paint(ansiMagenta, "meow! probe") + paint(ansiMuted, ": настройка"))
-	fmt.Println("Введите адрес статус-страницы и код из админки.")
-	for {
-		fmt.Print("\n  " + paint(ansiBold, "Адрес: "))
-		server, e := readLine(input)
-		if e != nil {
-			return probe.Config{}, e
-		}
-		fmt.Print("  " + paint(ansiBold, "Код подключения: "))
-		code, e := readLine(input)
-		if e != nil {
-			return probe.Config{}, e
-		}
-		if strings.HasPrefix(strings.ToLower(server), "http://") {
-			fmt.Println(paint(ansiYellow, "Внимание: HTTP без шифрования допустим только для локальной отладки."))
-		}
-		c, e := probe.Enroll(context.Background(), server, code)
-		if e != nil {
-			fmt.Println(paint(ansiRed, "Не получилось: "+e.Error()))
-			fmt.Println(paint(ansiMuted, "Проверьте адрес и запросите новый код в админке."))
-			continue
-		}
-		return c, nil
-	}
 }
 
 func readLine(input *bufio.Reader) (string, error) {
