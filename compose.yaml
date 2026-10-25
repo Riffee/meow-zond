@@ -1,0 +1,35 @@
+name: meow-zond
+
+services:
+  meow-zond:
+    build: .
+    image: meow-zond
+    container_name: meow-zond
+    restart: unless-stopped
+    init: true
+    network_mode: host
+    environment:
+      MEOW_SERVER: ${MEOW_SERVER:-}
+      MEOW_CODE: ${MEOW_CODE:-}
+      MEOW_PROBE_NAME: ${MEOW_PROBE_NAME:-meow-zond}
+    volumes:
+      - meow-zond-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_RAW
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 192m
+    cpus: 0.5
+    logging:
+      driver: json-file
+      options:
+        max-size: "64k"
+        max-file: "1"
+
+volumes:
+  meow-zond-data:

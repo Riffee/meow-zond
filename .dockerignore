@@ -1,0 +1,7 @@
+.git
+.env
+*.log
+README.md
+install.sh
+data
+/meow-zond
