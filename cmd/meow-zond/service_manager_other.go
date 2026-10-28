@@ -1,24 +1,39 @@
-//go:build !windows
+//go:build !windows && !linux
 
 package main
 
 import (
-	"bufio"
 	"errors"
 )
 
-func windowsServiceSupported() bool { return false }
+var errServiceUnsupported = errors.New("фоновая служба поддерживается только на Windows и Linux с systemd")
 
-func windowsServiceRunning() bool { return false }
+func serviceSupported() bool { return false }
 
-func windowsServiceInstalled() bool { return false }
+func servicePrivileged() bool { return false }
 
-func windowsServicePrompt(_ *bufio.Reader, _ string) (bool, error) { return false, nil }
+func serviceDir() string { return "" }
 
-func installWindowsService(_ string) error {
-	return errors.New("установка службы поддерживается только на Windows")
-}
+func serviceTroubleshootingHint() string { return errServiceUnsupported.Error() }
 
-func uninstallWindowsService() error {
-	return errors.New("удаление службы поддерживается только на Windows")
-}
+func currentServiceStatus() (serviceStatus, error) { return serviceStatus{}, errServiceUnsupported }
+
+func serviceRunning() bool { return false }
+
+func serviceInstalled() bool { return false }
+
+func serviceInstall(_ string) error { return errServiceUnsupported }
+
+func serviceRemove() error { return errServiceUnsupported }
+
+func serviceSync(_ string) error { return errServiceUnsupported }
+
+func serviceStart() error { return errServiceUnsupported }
+
+func serviceStop() error { return errServiceUnsupported }
+
+func serviceSetAutostart(bool) error { return errServiceUnsupported }
+
+func serviceElevate(_ string, _ string) error { return errServiceUnsupported }
+
+func samePath(a, b string) bool { return a == b }

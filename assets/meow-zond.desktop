@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=meow! probe
+Name[ru]=meow! зонд
+Comment=Network probe for meow! status
+Comment[ru]=Сетевой зонд для meow! status
+Exec=/usr/bin/meow-zond
+Icon=meow-zond
+Terminal=true
+Categories=System;Monitor;Network;
+Keywords=status;probe;monitor;vpn;

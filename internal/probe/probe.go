@@ -589,6 +589,10 @@ func (r *Runner) readIdentity(ctx context.Context, client *http.Client) (model.O
 }
 func (r *Runner) Check(parent context.Context, t model.Task, o model.Observation) model.Result {
 	now := time.Now()
+	// Reported latency is the network round trip of the check itself. Timing starts
+	// after DNS: a slow resolver, a throttled container or the probe's own bookkeeping
+	// would otherwise be added to every number the panel shows.
+	netStart := now
 	m := t.Monitor
 	v := model.Result{TaskID: t.ID, MonitorID: m.ID, ProbeID: t.ProbeID, Revision: m.Revision, Timestamp: now.Unix(), Outcome: "unknown", Network: "unknown", Web: "unknown", VPN: "unknown", Observation: o}
 	ctx, cancel := context.WithTimeout(parent, time.Duration(m.Timeout)*time.Second)
@@ -598,7 +602,7 @@ func (r *Runner) Check(parent context.Context, t model.Task, o model.Observation
 		v.Outcome = outcome
 		v.Stage = stage
 		if !latencySet {
-			v.Latency = float64(time.Since(now).Microseconds()) / 1000
+			v.Latency = float64(time.Since(netStart).Microseconds()) / 1000
 		}
 		return v
 	}
@@ -668,11 +672,15 @@ func (r *Runner) Check(parent context.Context, t model.Task, o model.Observation
 		v.Errno = errorCode(e)
 		return finish("down", "dns")
 	}
+	netStart = time.Now()
 	v.DNS = ips
 	if m.Kind == "icmp" {
-		state, configurationError := r.ping(ctx, address)
+		state, ms, configurationError := r.ping(ctx, address)
 		if configurationError {
 			return finish("configuration_error", "configuration_error")
+		}
+		if ms > 0 {
+			v.Latency, latencySet = ms, true
 		}
 		v.Network = state
 		v.ICMP = state
@@ -689,15 +697,16 @@ func (r *Runner) Check(parent context.Context, t model.Task, o model.Observation
 			icmp = make(chan string, 1)
 			go func() {
 				pingCtx, cancelPing := context.WithTimeout(parent, 3*time.Second)
-				state, _ := r.ping(pingCtx, address)
+				state, _, _ := r.ping(pingCtx, address)
 				cancelPing()
 				icmp <- state
 			}()
 		}
+		dialStart := time.Now()
 		dialer := r.path.dialer(time.Duration(m.Timeout) * time.Second)
 		conn, e := dialer.DialContext(ctx, "tcp", net.JoinHostPort(address, fmt.Sprint(m.Port)))
 		if m.Kind == "tcp" {
-			v.Latency = float64(time.Since(now).Microseconds()) / 1000
+			v.Latency = float64(time.Since(dialStart).Microseconds()) / 1000
 			latencySet = true
 			v.ICMP = <-icmp
 		}
@@ -707,7 +716,7 @@ func (r *Runner) Check(parent context.Context, t model.Task, o model.Observation
 			if m.Kind == "vpn" {
 				// A failed TCP connect is not proof that the server is down.
 				pingCtx, cancelPing := context.WithTimeout(parent, 3*time.Second)
-				v.ICMP, _ = r.ping(pingCtx, address)
+				v.ICMP, _, _ = r.ping(pingCtx, address)
 				cancelPing()
 				v.VPN = "down"
 			}
@@ -797,9 +806,17 @@ func (r *Runner) Check(parent context.Context, t model.Task, o model.Observation
 	return finish("configuration_error", "configuration_error")
 }
 
-func (r *Runner) ping(ctx context.Context, address string) (string, bool) {
+// pingRTT matches the reply line of iputils, busybox and Windows ping, which all
+// report the round trip as "time=12.3 ms" (Windows writes "time<1ms" for a sub
+// millisecond reply).
+var pingRTT = regexp.MustCompile(`(?i)time[=<]\s*([0-9]+(?:[.,][0-9]+)?)\s*ms`)
+
+// ping reports reachability and the measured round trip in milliseconds; the
+// latency is 0 when the reply line could not be parsed, so the caller falls back
+// to its own stopwatch.
+func (r *Runner) ping(ctx context.Context, address string) (string, float64, bool) {
 	if strings.HasPrefix(address, "-") {
-		return "unknown", true
+		return "unknown", 0, true
 	}
 	args := []string{"-n", "-c", "1", "-W", "2", address}
 	if runtime.GOOS == "windows" {
@@ -808,7 +825,7 @@ func (r *Runner) ping(ctx context.Context, address string) (string, bool) {
 	if r.path.VPN && r.path.Enforced {
 		if runtime.GOOS == "windows" {
 			if r.path.LocalIP == nil || r.path.LocalIP.To4() == nil {
-				return "unknown", true
+				return "unknown", 0, true
 			}
 			args = append(args, "-S", r.path.LocalIP.String())
 		} else {
@@ -819,17 +836,34 @@ func (r *Runner) ping(ctx context.Context, address string) (string, bool) {
 	if e != nil {
 		var commandError *exec.Error
 		if errors.As(e, &commandError) || os.IsPermission(e) {
-			return "unknown", true
+			return "unknown", 0, true
 		}
 		if strings.Contains(strings.ToLower(string(out)), "permi") || strings.Contains(strings.ToLower(string(out)), "privilege") {
-			return "unknown", true
+			return "unknown", 0, true
 		}
-		return "down", false
+		return "down", 0, false
 	}
-	if runtime.GOOS == "windows" && !strings.Contains(strings.ToLower(string(out)), "ttl=") {
-		return "down", false
+	text := string(out)
+	if runtime.GOOS == "windows" && !strings.Contains(strings.ToLower(text), "ttl=") {
+		return "down", 0, false
 	}
-	return "up", false
+	ms := parsePingRTT(text)
+	return "up", ms, false
+}
+
+// parsePingRTT reads the round trip from the last reply line; 0 means the output
+// was not in a shape we recognise and the caller should time the command itself.
+func parsePingRTT(text string) float64 {
+	matches := pingRTT.FindAllStringSubmatch(text, -1)
+	if len(matches) == 0 {
+		return 0
+	}
+	value := strings.ReplaceAll(matches[len(matches)-1][1], ",", ".")
+	ms, e := strconv.ParseFloat(value, 64)
+	if e != nil || ms <= 0 || ms > 60_000 {
+		return 0
+	}
+	return ms
 }
 
 func dnsMatch(record string, values []string, expected string) bool {

@@ -3,10 +3,8 @@
 package main
 
 import (
-	"bufio"
 	"errors"
 	"fmt"
-	"io"
 	"meowzond/internal/probe"
 	"os"
 	"os/exec"
@@ -14,6 +12,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unsafe"
 
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/svc"
@@ -23,10 +22,22 @@ import (
 const probeServiceName = "MeowStatusProbe"
 const probeServiceDisplay = "Meow Status Probe"
 
-func windowsServiceSupported() bool { return true }
+func serviceSupported() bool { return true }
 
-func elevated() bool {
+func servicePrivileged() bool {
 	return windows.GetCurrentProcessToken().IsElevated()
+}
+
+func serviceTroubleshootingHint() string {
+	return `проверьте «Службы» (services.msc) и C:\ProgramData\MeowProbe\probe-service.log`
+}
+
+func serviceDir() string {
+	root := os.Getenv("ProgramData")
+	if root == "" {
+		root = `C:\ProgramData`
+	}
+	return filepath.Join(root, "MeowProbe")
 }
 
 func serviceHandle() (*mgr.Mgr, *mgr.Service, error) {
@@ -45,20 +56,10 @@ func serviceHandle() (*mgr.Mgr, *mgr.Service, error) {
 	return m, s, nil
 }
 
-func windowsServiceRunning() bool {
-	installed, state, err := serviceState()
-	return err == nil && installed && state == svc.Running
-}
-
-func windowsServiceInstalled() bool {
-	installed, _, err := serviceState()
-	return err == nil && installed
-}
-
-func serviceState() (bool, svc.State, error) {
-	// Read-only access works for standard users. mgr.Connect requests
-	// SC_MANAGER_ALL_ACCESS and would make a normal console launch fail with
-	// access denied before the user can even see the menu.
+// queryService asks the service control manager for the installed state using
+// read-only access. mgr.Connect requests full access and would make a normal
+// console launch fail with access denied before the user can even see the menu.
+func queryService() (bool, svc.State, error) {
 	manager, err := windows.OpenSCManager(nil, nil, windows.SC_MANAGER_CONNECT)
 	if err != nil {
 		return false, 0, err
@@ -68,7 +69,7 @@ func serviceState() (bool, svc.State, error) {
 	if err != nil {
 		return false, 0, err
 	}
-	service, err := windows.OpenService(manager, name, windows.SERVICE_QUERY_STATUS)
+	service, err := windows.OpenService(manager, name, windows.SERVICE_QUERY_STATUS|windows.SERVICE_QUERY_CONFIG)
 	if err != nil {
 		if errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
 			return false, svc.Stopped, nil
@@ -83,162 +84,88 @@ func serviceState() (bool, svc.State, error) {
 	return true, svc.State(status.CurrentState), nil
 }
 
-func windowsServicePrompt(input *bufio.Reader, configPath string) (bool, error) {
-	installed, state, err := serviceState()
+// serviceStartType reads the boot behaviour. A standard user can normally query the
+// configuration; when even that is refused the installer's own choice (automatic) is
+// reported instead of failing the whole status screen.
+func serviceStartType() (uint32, bool) {
+	manager, err := windows.OpenSCManager(nil, nil, windows.SC_MANAGER_CONNECT)
 	if err != nil {
-		fmt.Println()
-		fmt.Println("Не удалось проверить фоновую службу Windows. Продолжаю в консоли.")
-		fmt.Println("Причина:", err)
-		return false, nil
+		return windows.SERVICE_AUTO_START, false
 	}
-	if installed {
-		running := state == svc.Running
-		fmt.Println()
-		if running {
-			fmt.Printf("Зонд уже работает в фоне как служба Windows «%s».\n", probeServiceDisplay)
-		} else {
-			fmt.Printf("Служба Windows «%s» установлена, но остановлена.\n", probeServiceDisplay)
-		}
-		fmt.Println("1 — " + map[bool]string{true: "остановить службу", false: "запустить службу"}[running])
-		fmt.Println("2 — удалить службу")
-		fmt.Println("0 — выход")
-		for {
-			fmt.Print("Выбор: ")
-			line, e := readLine(input)
-			if e != nil {
-				return true, nil
-			}
-			switch line {
-			case "1":
-				if running {
-					err = stopWindowsService()
-				} else {
-					err = startWindowsService()
-				}
-				if err != nil {
-					fmt.Println("Ошибка:", err)
-				} else if running {
-					fmt.Println("Служба остановлена.")
-				} else {
-					fmt.Println("Служба запущена.")
-				}
-				return true, nil
-			case "2":
-				if !elevated() {
-					fmt.Println("Для удаления службы запустите программу от имени администратора.")
-					continue
-				}
-				if err = uninstallWindowsService(); err != nil {
-					fmt.Println("Ошибка:", err)
-					continue
-				}
-				fmt.Println("Служба удалена.")
-				return true, nil
-			case "0", "q":
-				return true, nil
-			default:
-				fmt.Println("Введите 1, 2 или 0.")
-			}
-		}
+	defer windows.CloseServiceHandle(manager)
+	name, err := windows.UTF16PtrFromString(probeServiceName)
+	if err != nil {
+		return windows.SERVICE_AUTO_START, false
 	}
-	if elevated() {
-		fmt.Println()
-		fmt.Println("Установить фоновую службу Windows?")
-		fmt.Println("Зонд продолжит работать после закрытия этого окна и после перезагрузки.")
-		fmt.Println("1 — установить и запустить")
-		fmt.Println("2 — остаться в консоли")
-		for {
-			fmt.Print("Выбор: ")
-			line, e := readLine(input)
-			if e != nil {
-				return false, nil
-			}
-			switch line {
-			case "1":
-				if err := installWindowsService(configPath); err != nil {
-					return false, fmt.Errorf("не удалось установить службу: %w", err)
-				}
-				fmt.Println()
-				fmt.Println("Готово. Служба установлена и запущена — это окно можно закрыть.")
-				return true, nil
-			case "2":
-				return false, nil
-			case "":
-			default:
-				fmt.Println("Введите 1 или 2.")
-			}
-		}
+	service, err := windows.OpenService(manager, name, windows.SERVICE_QUERY_CONFIG)
+	if err != nil {
+		return windows.SERVICE_AUTO_START, false
 	}
-	fmt.Println()
-	fmt.Println("Для работы без открытого окна нужна фоновая служба Windows.")
-	fmt.Println("Windows покажет запрос на разрешение администратора.")
-	fmt.Println("1 — установить и запустить службу")
-	fmt.Println("2 — остаться в консоли")
-	for {
-		fmt.Print("Выбор: ")
-		line, e := readLine(input)
-		if e != nil {
-			return false, nil
-		}
-		switch line {
-		case "1":
-			if err := elevateInstall(configPath); err != nil {
-				fmt.Println("Не удалось запросить права администратора:", err)
-				continue
-			}
-			fmt.Println("Подтвердите установку в окне Windows. Эта консоль больше не нужна.")
-			return true, nil
-		case "2":
-			return false, nil
-		case "":
-		default:
-			fmt.Println("Введите 1 или 2.")
-		}
+	defer windows.CloseServiceHandle(service)
+	needed := uint32(0)
+	if err := windows.QueryServiceConfig(service, nil, 0, &needed); err != nil && needed == 0 {
+		return windows.SERVICE_AUTO_START, false
+	}
+	buffer := make([]byte, needed)
+	config := (*windows.QUERY_SERVICE_CONFIG)(unsafe.Pointer(&buffer[0]))
+	if err := windows.QueryServiceConfig(service, config, uint32(len(buffer)), &needed); err != nil {
+		return windows.SERVICE_AUTO_START, false
+	}
+	return config.StartType, true
+}
+
+func currentServiceStatus() (serviceStatus, error) {
+	var st serviceStatus
+	installed, state, err := queryService()
+	st.installed = installed
+	if err != nil {
+		return st, err
+	}
+	if !installed {
+		return st, nil
+	}
+	st.running = state == svc.Running
+	startType, _ := serviceStartType()
+	st.autostart = startType == windows.SERVICE_AUTO_START || startType == windows.SERVICE_BOOT_START
+	st.state = windowsServiceStateText(state)
+	return st, nil
+}
+
+func windowsServiceStateText(state svc.State) string {
+	switch state {
+	case svc.Running:
+		return "работает"
+	case svc.StartPending:
+		return "запускается"
+	case svc.StopPending:
+		return "останавливается"
+	default:
+		return "остановлена"
 	}
 }
 
-func elevateInstall(configPath string) error {
-	exe, err := os.Executable()
-	if err != nil {
-		return err
-	}
-	abs, err := filepath.Abs(configPath)
-	if err != nil {
-		return err
-	}
-	verb, err := windows.UTF16PtrFromString("runas")
-	if err != nil {
-		return err
-	}
-	file, err := windows.UTF16PtrFromString(exe)
-	if err != nil {
-		return err
-	}
-	args, err := windows.UTF16PtrFromString("-install-service -config " + syscall.EscapeArg(abs))
-	if err != nil {
-		return err
-	}
-	if err = windows.ShellExecute(0, verb, file, args, nil, windows.SW_SHOWNORMAL); err != nil {
-		return err
-	}
-	return nil
+func serviceRunning() bool {
+	st, e := currentServiceStatus()
+	return e == nil && st.running
 }
 
-func installWindowsService(configPath string) error {
-	if !elevated() {
+func serviceInstalled() bool {
+	st, e := currentServiceStatus()
+	return e == nil && st.installed
+}
+
+func serviceInstall(configPath string) error {
+	if !servicePrivileged() {
 		return errors.New("нужны права администратора: запустите программу от имени администратора")
 	}
-	if installed, _, err := serviceState(); err != nil {
+	if installed, _, err := queryService(); err != nil {
 		return err
 	} else if installed {
 		return fmt.Errorf("служба %s уже установлена", probeServiceName)
 	}
-	c, err := probe.Load(configPath)
+	c, err := registeredConfig(configPath)
 	if err != nil {
-		return fmt.Errorf("не удалось прочитать настройки: %w", err)
-	}
-	if c.ProbeID == "" || len(c.Token) < 32 {
-		return errors.New("сначала подключите зонд")
+		return err
 	}
 	exe, err := os.Executable()
 	if err != nil {
@@ -254,29 +181,15 @@ func installWindowsService(configPath string) error {
 			return fmt.Errorf("не удалось скопировать агент: %w", err)
 		}
 	}
-	if c.XrayPath != "" {
-		if info, statErr := os.Stat(c.XrayPath); statErr == nil && info.Mode().IsRegular() {
-			xrayDest := filepath.Join(dir, filepath.Base(c.XrayPath))
-			if !samePath(c.XrayPath, xrayDest) {
-				if err = copyFile(c.XrayPath, xrayDest); err != nil {
-					return fmt.Errorf("не удалось скопировать Xray: %w", err)
-				}
-			}
-			c.XrayPath = xrayDest
-		}
+	if err = prepareServiceConfig(&c, dir); err != nil {
+		return err
 	}
-	c.Spool = filepath.Join(dir, "probe-results.json")
-	serviceConfig := filepath.Join(dir, "probe.json")
+	serviceConfig := serviceConfigPath(dir)
 	if err = probe.Save(serviceConfig, c); err != nil {
 		return fmt.Errorf("не удалось сохранить настройки службы: %w", err)
 	}
-	if out, err := exec.Command("icacls.exe", dir, "/grant", "*S-1-5-19:(OI)(CI)M", "/T").CombinedOutput(); err != nil {
-		return fmt.Errorf("не удалось выдать права LocalService: %v: %s", err, strings.TrimSpace(string(out)))
-	}
-	for _, path := range []string{serviceExe, serviceConfig} {
-		if out, err := exec.Command("icacls.exe", path, "/grant", "*S-1-5-19:RX").CombinedOutput(); err != nil {
-			return fmt.Errorf("не удалось выдать доступ к %s: %v: %s", path, err, strings.TrimSpace(string(out)))
-		}
+	if err = grantServiceAccess(dir, serviceExe, serviceConfig); err != nil {
+		return err
 	}
 	m, err := mgr.Connect()
 	if err != nil {
@@ -301,22 +214,73 @@ func installWindowsService(configPath string) error {
 	if err = s.Start(); err != nil {
 		return fmt.Errorf("служба создана, но не запустилась: %w", err)
 	}
-	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
-		status, e := s.Query()
-		if e == nil && status.State == svc.Running {
-			return nil
-		}
-		if e == nil && status.State == svc.Stopped {
-			return errors.New("служба завершилась сразу после запуска; проверьте probe-service.log")
-		}
-		time.Sleep(200 * time.Millisecond)
-	}
-	return errors.New("служба запускается слишком долго; проверьте её состояние в services.msc")
+	return nil
 }
 
-func startWindowsService() error {
-	if !elevated() {
+// grantServiceAccess gives the LocalService account read access to the files the
+// service needs; without it the service starts and immediately fails on its settings.
+func grantServiceAccess(dir string, files ...string) error {
+	if out, err := exec.Command("icacls.exe", dir, "/grant", "*S-1-5-19:(OI)(CI)M", "/T").CombinedOutput(); err != nil {
+		return fmt.Errorf("не удалось выдать права LocalService: %v: %s", err, strings.TrimSpace(string(out)))
+	}
+	for _, path := range files {
+		if out, err := exec.Command("icacls.exe", path, "/grant", "*S-1-5-19:RX").CombinedOutput(); err != nil {
+			return fmt.Errorf("не удалось выдать доступ к %s: %v: %s", path, err, strings.TrimSpace(string(out)))
+		}
+	}
+	return nil
+}
+
+// serviceSync replaces the service settings with the ones entered in this console —
+// including a new status-page address — and refreshes the program file. The service
+// process must be stopped first: Windows does not let a running executable be replaced.
+func serviceSync(consoleConfig string) error {
+	if !servicePrivileged() {
+		return errors.New("нужны права администратора")
+	}
+	installed, _, err := queryService()
+	if err != nil {
+		return err
+	}
+	if !installed {
+		return errors.New("фоновая служба не установлена")
+	}
+	c, err := registeredConfig(consoleConfig)
+	if err != nil {
+		return err
+	}
+	if serviceRunning() {
+		if err = serviceStop(); err != nil {
+			return err
+		}
+	}
+	dir := serviceDir()
+	if err = os.MkdirAll(dir, 0755); err != nil {
+		return fmt.Errorf("не удалось создать %s: %w", dir, err)
+	}
+	serviceExe := filepath.Join(dir, "meow-probe.exe")
+	if exe, e := os.Executable(); e == nil {
+		if !samePath(exe, serviceExe) {
+			if e = copyFile(exe, serviceExe); e != nil {
+				return fmt.Errorf("не удалось обновить агент: %w", e)
+			}
+		}
+	}
+	if err = prepareServiceConfig(&c, dir); err != nil {
+		return err
+	}
+	serviceConfig := serviceConfigPath(dir)
+	if err = probe.Save(serviceConfig, c); err != nil {
+		return fmt.Errorf("не удалось сохранить настройки службы: %w", err)
+	}
+	if err = grantServiceAccess(dir, serviceExe, serviceConfig); err != nil {
+		return err
+	}
+	return serviceStart()
+}
+
+func serviceStart() error {
+	if !servicePrivileged() {
 		return errors.New("нужны права администратора")
 	}
 	m, s, err := serviceHandle()
@@ -342,8 +306,8 @@ func startWindowsService() error {
 	return errors.New("служба не перешла в состояние RUNNING")
 }
 
-func stopWindowsService() error {
-	if !elevated() {
+func serviceStop() error {
+	if !servicePrivileged() {
 		return errors.New("нужны права администратора")
 	}
 	m, s, err := serviceHandle()
@@ -373,9 +337,46 @@ func stopWindowsService() error {
 	return errors.New("служба не остановилась за 15 секунд")
 }
 
-func uninstallWindowsService() error {
-	if !elevated() {
+// serviceSetAutostart keeps the service installed and only changes whether Windows
+// starts it on boot: stopping autostart is what the user asks for when the probe
+// must not come back after a reboot, not when the program should disappear.
+func serviceSetAutostart(on bool) error {
+	if !servicePrivileged() {
 		return errors.New("нужны права администратора")
+	}
+	m, s, err := serviceHandle()
+	if err != nil {
+		return err
+	}
+	defer m.Disconnect()
+	defer s.Close()
+	// UpdateConfig writes every field it is given, so the current configuration is
+	// read first and only the start type is changed.
+	config, err := s.Config()
+	if err != nil {
+		return fmt.Errorf("не удалось прочитать настройки службы: %w", err)
+	}
+	config.StartType = windows.SERVICE_DEMAND_START
+	if on {
+		config.StartType = windows.SERVICE_AUTO_START
+	}
+	if err = s.UpdateConfig(config); err != nil {
+		return fmt.Errorf("не удалось изменить автозапуск: %w", err)
+	}
+	if on {
+		return serviceStart()
+	}
+	return nil
+}
+
+func serviceRemove() error {
+	if !servicePrivileged() {
+		return errors.New("нужны права администратора")
+	}
+	if serviceRunning() {
+		if err := serviceStop(); err != nil {
+			return fmt.Errorf("служба осталась запущенной и не удалена: %w", err)
+		}
 	}
 	m, s, err := serviceHandle()
 	if err != nil {
@@ -385,45 +386,40 @@ func uninstallWindowsService() error {
 		return err
 	}
 	defer m.Disconnect()
-	_ = stopWindowsService()
 	defer s.Close()
-	if err = s.Delete(); err != nil {
+	return s.Delete()
+}
+
+// serviceElevate runs one operation in an elevated helper process through UAC and
+// maps the cancelled dialog to a plain answer.
+func serviceElevate(action, configPath string) error {
+	exe, err := os.Executable()
+	if err != nil {
 		return err
+	}
+	abs, err := filepath.Abs(configPath)
+	if err != nil {
+		return err
+	}
+	verb, err := windows.UTF16PtrFromString("runas")
+	if err != nil {
+		return err
+	}
+	file, err := windows.UTF16PtrFromString(exe)
+	if err != nil {
+		return err
+	}
+	args, err := windows.UTF16PtrFromString("-" + action + " -config " + syscall.EscapeArg(abs))
+	if err != nil {
+		return err
+	}
+	if err = windows.ShellExecute(0, verb, file, args, nil, windows.SW_SHOWNORMAL); err != nil {
+		if errors.Is(err, windows.ERROR_CANCELLED) {
+			return errors.New("подтверждение прав не получено")
+		}
+		return fmt.Errorf("запуск от имени администратора не удался: %w", err)
 	}
 	return nil
-}
-
-func serviceDir() string {
-	root := os.Getenv("ProgramData")
-	if root == "" {
-		root = `C:\ProgramData`
-	}
-	return filepath.Join(root, "MeowProbe")
-}
-
-func copyFile(src, dst string) error {
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-	tmp := dst + ".new"
-	out, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0755)
-	if err != nil {
-		return err
-	}
-	_, copyErr := io.Copy(out, in)
-	closeErr := out.Close()
-	if copyErr != nil {
-		_ = os.Remove(tmp)
-		return copyErr
-	}
-	if closeErr != nil {
-		_ = os.Remove(tmp)
-		return closeErr
-	}
-	_ = os.Remove(dst)
-	return os.Rename(tmp, dst)
 }
 
 func samePath(a, b string) bool {

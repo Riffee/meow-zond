@@ -3,7 +3,9 @@ name: meow-zond
 services:
   meow-zond:
     build: .
-    image: meow-zond
+    # Set MEOW_ZOND_IMAGE=ghcr.io/riffee/meow-zond:latest in .env to run the
+    # published image instead of building the probe from this checkout.
+    image: ${MEOW_ZOND_IMAGE:-meow-zond}
     container_name: meow-zond
     restart: unless-stopped
     init: true
@@ -23,7 +25,9 @@ services:
     security_opt:
       - no-new-privileges:true
     mem_limit: 192m
-    cpus: 0.5
+    # 0.5 vCPU throttled the probe mid-check: the fork+exec of ping and the TLS
+    # handshake queue added milliseconds that the panel then showed as latency.
+    cpus: 1
     logging:
       driver: json-file
       options:

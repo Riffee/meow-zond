@@ -6,12 +6,51 @@
     <img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="MIT License">
     <img src="https://img.shields.io/badge/Language-Bash-4EAA25.svg?logo=gnu-bash&logoColor=white" alt="Bash">
     <img src="https://img.shields.io/badge/Tech-Docker-2496ED.svg?logo=docker&logoColor=white" alt="Docker">
-    <img src="https://img.shields.io/badge/Release-v1.0.0-blueviolet.svg" alt="Version">
+    <img src="https://img.shields.io/badge/Release-v1.1.0-blueviolet.svg" alt="Version">
   </p>
   <p><a href="README.md">English</a> / <strong>Русский</strong></p>
 </div>
 
-## Установка одной командой
+## Установка
+
+### Windows
+
+Скачайте `meow-zond-windows-amd64.exe` из
+[последнего релиза](https://github.com/Riffee/meow-zond/releases/latest) и
+запустите двойным щелчком: у процесса будет иконка логотипа сайта. Программа
+спросит адрес статус-страницы и имя зонда, подключит зонд и спросит, оставлять
+ли его в фоне:
+
+- **Установить фоновую службу с автозапуском** — зонд переживает закрытие окна и
+  перезагрузку Windows. Перед созданием службы показывается адрес, куда будут
+  уходить данные, и его можно изменить прямо там, поэтому служба не может остаться
+  привязанной к старому серверу. Если окно не администратора — появится запрос UAC.
+- **Остаться в консоли** — данные отправляются, пока открыто это окно.
+
+Программу можно открыть в любой момент повторно: на первом экране видно состояние
+службы, а пункт **4 — Фоновая служба и автозапуск** умеет запускать, останавливать,
+выключать автозапуск и удалять службу. Настройки хранятся в
+`C:\Users\<вы>\AppData\Local\MeowProbe\probe.json`.
+
+### Linux (.deb)
+
+```bash
+sudo dpkg -i meow-zond_1.1.0_amd64.deb
+meow-zond                       # подключить зонд и работать через меню
+sudo meow-zond -install-service # либо фоновая служба с автозапуском
+```
+
+Пакет ставит `/usr/bin/meow-zond`, пиктограмму логотипа, пункт меню и
+**выключенную** службу systemd, поэтому ничего само не стартует:
+
+```bash
+sudo systemctl enable --now meow-zond   # запустить и оставить с автозапуском
+sudo systemctl stop meow-zond           # пауза, автозапуск остаётся включённым
+sudo systemctl disable meow-zond        # после перезагрузки зонд не вернётся
+meow-zond                               # то же самое через меню с статусом службы
+```
+
+### Контейнер
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Riffee/meow-zond/main/install.sh | sudo bash
@@ -20,6 +59,13 @@ curl -fsSL https://raw.githubusercontent.com/Riffee/meow-zond/main/install.sh | 
 Установщик клонирует репозиторий в `/opt/meow-zond`, при необходимости
 установит Docker, спросит адрес статус-страницы и имя зонда, затем соберёт и
 запустит контейнер `meow-zond`. Коды и ключи подключения не нужны.
+
+Взять опубликованный образ вместо сборки из исходников:
+
+```bash
+echo 'MEOW_ZOND_IMAGE=ghcr.io/riffee/meow-zond:latest' | sudo tee -a /opt/meow-zond/.env
+cd /opt/meow-zond && docker compose up -d --pull always
+```
 
 Скрипт: [install.sh](https://raw.githubusercontent.com/Riffee/meow-zond/main/install.sh)
 
@@ -95,7 +141,7 @@ docker compose down -v
 ## Структура
 
 ```text
-cmd/meow-zond          консольный/headless агент и Windows-служба
+cmd/meow-zond          консольное меню, headless-агент, служба Windows и служба systemd
 internal/probe         сетевые проверки, Xray и spool
 internal/model         общие типы монитора, задания и результата
 internal/secure        идентификаторы и хеши

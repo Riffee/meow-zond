@@ -62,20 +62,35 @@ func printBanner(c probe.Config, configPath string) {
 	fmt.Println()
 }
 
-func printMenu(enabled bool) {
+func printMenu(probeEnabled, serviceSupported bool) {
 	fmt.Println()
 	fmt.Println(paint(ansiMuted, "  Действия"))
-	if enabled {
+	if probeEnabled {
 		fmt.Println("  " + paint(ansiMagenta, "1") + "  Выключить зонд")
 		fmt.Println("  " + paint(ansiMagenta, "2") + "  Обновить статус")
-		fmt.Println("  " + paint(ansiMagenta, "0") + "  Выключить и выйти")
 	} else {
 		fmt.Println("  " + paint(ansiMagenta, "1") + "  Включить зонд")
 		fmt.Println("  " + paint(ansiMagenta, "2") + "  Показать статус")
+	}
+	fmt.Println("  " + paint(ansiMagenta, "3") + "  Сменить адрес статус-страницы")
+	if serviceSupported {
+		fmt.Println("  " + paint(ansiMagenta, "4") + "  Фоновая служба и автозапуск")
+	}
+	if probeEnabled {
+		fmt.Println("  " + paint(ansiMagenta, "0") + "  Выключить и выйти")
+	} else {
 		fmt.Println("  " + paint(ansiMagenta, "0") + "  Выход")
 	}
 	fmt.Println(paint(ansiMuted, "  Ctrl+C — выключить и выйти"))
 	fmt.Print("\n  " + paint(ansiBold, "Выбор: "))
+}
+
+func printNotice(notice string) {
+	if notice == "" {
+		return
+	}
+	fmt.Println()
+	fmt.Println("  " + notice)
 }
 
 func printRunnerStatus(r *probe.Runner) {
@@ -150,9 +165,15 @@ func printRunnerStatus(r *probe.Runner) {
 	}
 }
 
-func printOffStatus() {
+func printOffStatus(backgroundRunning bool) {
 	fmt.Println()
 	fmt.Println(paint(ansiMuted, "  Состояние"))
-	fmt.Printf("  %-12s %s\n", paint(ansiMuted, "зонд"), paint(ansiMuted, "ВЫКЛЮЧЕН"))
-	fmt.Println(paint(ansiMuted, "  Данные не отправляются, пока зонд выключен."))
+	state := paint(ansiMuted, "ВЫКЛЮЧЕН")
+	note := "Данные не отправляются, пока зонд выключен."
+	if backgroundRunning {
+		state = paint(ansiGreen, "РАБОТАЕТ В ФОНЕ")
+		note = "Зонд отправляет данные из фоновой службы — это окно ничего не отправляет."
+	}
+	fmt.Printf("  %-12s %s\n", paint(ansiMuted, "зонд"), state)
+	fmt.Println(paint(ansiMuted, "  "+note))
 }

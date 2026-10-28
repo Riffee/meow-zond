@@ -170,6 +170,43 @@ func TestTCPFailureRecordsICMPAnswer(t *testing.T) {
 	}
 }
 
+func TestICMPLatencyComesFromPingReply(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses a POSIX ping stub")
+	}
+	dir := t.TempDir()
+	stub := "#!/bin/sh\nsleep 0.2\nprintf '64 bytes from 127.0.0.1: icmp_seq=1 ttl=64 time=4.2 ms\\n'\n"
+	if e := os.WriteFile(filepath.Join(dir, "ping"), []byte(stub), 0755); e != nil {
+		t.Fatal(e)
+	}
+	t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
+	runner := &Runner{}
+	m := model.Monitor{Kind: "icmp", Address: "localhost", Timeout: 5}
+	v := runner.Check(context.Background(), model.Task{Monitor: m, Expires: time.Now().Add(time.Minute).Unix()}, model.Observation{Healthy: true, Direct: true})
+	if v.Outcome != "up" {
+		t.Fatalf("stubbed ping must report up: %+v", v)
+	}
+	if v.Latency < 4.1 || v.Latency > 4.3 {
+		t.Fatalf("latency must be the reply round trip, not the stopwatch: %v", v.Latency)
+	}
+}
+
+func TestParsePingRTT(t *testing.T) {
+	cases := map[string]float64{
+		"PING localhost (127.0.0.1) 56(84) bytes of data.\n64 bytes from localhost: icmp_seq=1 ttl=64 time=12.3 ms\n": 12.3,
+		"64 bytes from 1.1.1.1: icmp_seq=2 ttl=57 time=0,45 ms\n":                                                     0.45,
+		"PING google.com\n reply from google.com: sequence=0 ttl=57 time=8 ms\n":                                      8,
+		"Reply from 1.1.1.1: bytes=32 time<1ms TTL=128\n":                                                             1,
+		"PING 1.1.1.1\nno reply\n":               0,
+		"64 bytes from 1.1.1.1: time=99999 ms\n": 0,
+	}
+	for output, want := range cases {
+		if got := parsePingRTT(output); got != want {
+			t.Errorf("parsePingRTT(%q) = %v, want %v", output, got, want)
+		}
+	}
+}
+
 func TestDNSMonitorTypes(t *testing.T) {
 	runner := &Runner{}
 	observation := model.Observation{Healthy: true, Direct: true}

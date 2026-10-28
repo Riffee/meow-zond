@@ -3,3 +3,5 @@
 data/
 /meow-zond
 .DS_Store
+/dist/
+/build/
