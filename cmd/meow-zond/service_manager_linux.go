@@ -32,13 +32,20 @@ var (
 var systemBinaryDirs = []string{"/usr/local/bin", "/usr/bin", "/bin", "/sbin", "/usr/sbin"}
 
 func serviceSupported() bool {
-	// systemd exposes /run/systemd/system only when it is PID 1: on sysvinit,
-	// containers and WSL without systemd there is no service manager to talk to.
+	return systemdMissing() == nil
+}
+
+// systemdMissing keeps the reason in Russian instead of leaking the exec error of
+// a binary that is not installed: systemd exposes /run/systemd/system only when it
+// is PID 1, so sysvinit, containers and WSL without systemd have nothing to talk to.
+func systemdMissing() error {
 	if _, e := os.Stat(serviceRuntimeDir); e != nil {
-		return false
+		return errors.New("systemd не найден: фоновая служба доступна только на системах с systemd")
 	}
-	_, e := exec.LookPath("systemctl")
-	return e == nil
+	if _, e := exec.LookPath("systemctl"); e != nil {
+		return errors.New("не найден systemctl: установите systemd")
+	}
+	return nil
 }
 
 func servicePrivileged() bool { return os.Geteuid() == 0 }
@@ -65,6 +72,9 @@ func installedUnitPath() (string, bool) {
 }
 
 func systemctl(ctx context.Context, args ...string) (string, error) {
+	if e := systemdMissing(); e != nil {
+		return "", e
+	}
 	out, e := exec.CommandContext(ctx, "systemctl", args...).CombinedOutput()
 	text := strings.TrimSpace(string(out))
 	if e != nil {
@@ -79,6 +89,9 @@ func systemctl(ctx context.Context, args ...string) (string, error) {
 // systemctlFlag reads a yes/no answer that systemd reports through the exit code:
 // 0 is yes, 1 and 3 are honest no-answers, anything else is a real failure.
 func systemctlFlag(state string) (bool, string, error) {
+	if e := systemdMissing(); e != nil {
+		return false, "", e
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	out, e := exec.CommandContext(ctx, "systemctl", state, serviceName).CombinedOutput()
@@ -147,8 +160,8 @@ func serviceInstalled() bool {
 }
 
 func serviceInstall(configPath string) error {
-	if !serviceSupported() {
-		return errors.New("systemd не найден: фоновая служба доступна только на системах с systemd")
+	if e := systemdMissing(); e != nil {
+		return e
 	}
 	if !servicePrivileged() {
 		return errors.New("нужны права root: выполните sudo meow-zond -install-service")
