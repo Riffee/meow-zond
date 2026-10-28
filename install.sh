@@ -96,9 +96,11 @@ docker info >/dev/null 2>&1 || die "Docker daemon недоступен"
 
 server="${MEOW_SERVER:-}"
 name="${MEOW_PROBE_NAME:-}"
+image=""
 if [[ -f .env ]]; then
   [[ -n "$server" ]] || server="$(env_value MEOW_SERVER)"
   [[ -n "$name" ]] || name="$(env_value MEOW_PROBE_NAME)"
+  image="$(env_value MEOW_ZOND_IMAGE)"
 fi
 
 [[ -n "$server" ]] || server="$(ask "Адрес статус-страницы (https://...)" "")"
@@ -124,11 +126,22 @@ umask 077
 {
   printf 'MEOW_SERVER=%s\n' "$server"
   printf "MEOW_PROBE_NAME='%s'\n" "$name"
+  # A host that runs the published image instead of building it here must not
+  # lose that choice when the installer rewrites the file.
+  if [[ -n "$image" ]]; then
+    printf 'MEOW_ZOND_IMAGE=%s\n' "$image"
+  fi
 } > .env
 chmod 600 .env
 
-echo "Собираю и запускаю контейнер meow-zond…"
-docker compose up -d --build
+if [[ -n "$image" ]]; then
+  echo "Обновляю опубликованный образ ${image}…"
+  docker compose pull
+  docker compose up -d
+else
+  echo "Собираю и запускаю контейнер meow-zond…"
+  docker compose up -d --build
+fi
 
 sleep 2
 docker compose ps
