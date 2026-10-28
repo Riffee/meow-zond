@@ -587,6 +587,61 @@ func (r *Runner) readIdentity(ctx context.Context, client *http.Client) (model.O
 	}
 	return model.Observation{}, false
 }
+
+// dialTargets converts the answer the probe already has into socket addresses.
+// Handing a dialer the hostname instead makes it resolve the name a second time,
+// and that resolver round trip would be added to every latency the panel shows.
+// IPv4 comes first because a host without an IPv6 route must not pay for the
+// unusable family before reaching the working one.
+func dialTargets(ips []string, port string) []string {
+	targets := make([]string, 0, len(ips))
+	var secondary []string
+	for _, ip := range ips {
+		parsed := net.ParseIP(strings.TrimSpace(ip))
+		if parsed == nil {
+			continue
+		}
+		target := net.JoinHostPort(parsed.String(), port)
+		if parsed.To4() == nil {
+			secondary = append(secondary, target)
+			continue
+		}
+		targets = append(targets, target)
+	}
+	return append(targets, secondary...)
+}
+
+// dialAny connects to the first address that answers. Without a usable route the
+// kernel fails an attempt immediately, so only a silently dropped SYN consumes
+// the per-address budget, and the caller's deadline always wins.
+func dialAny(ctx context.Context, dialer *net.Dialer, targets []string) (net.Conn, error) {
+	if len(targets) == 0 {
+		return nil, errors.New("no address to dial")
+	}
+	var last error
+	for i, target := range targets {
+		var conn net.Conn
+		var e error
+		if len(targets)-i == 1 {
+			conn, e = dialer.DialContext(ctx, "tcp", target)
+		} else {
+			conn, e = func() (net.Conn, error) {
+				attempt, cancel := context.WithTimeout(ctx, 3*time.Second)
+				defer cancel()
+				return dialer.DialContext(attempt, "tcp", target)
+			}()
+		}
+		if e == nil {
+			return conn, nil
+		}
+		last = e
+		if ctx.Err() != nil {
+			break
+		}
+	}
+	return nil, last
+}
+
 func (r *Runner) Check(parent context.Context, t model.Task, o model.Observation) model.Result {
 	now := time.Now()
 	// Reported latency is the network round trip of the check itself. Timing starts
@@ -689,7 +744,7 @@ func (r *Runner) Check(parent context.Context, t model.Task, o model.Observation
 		}
 		return finish("down", "timeout")
 	}
-	if m.Kind == "tcp" || m.Kind == "vpn" {
+	if m.Kind == "tcp" || m.Kind == "vpn" || m.Kind == "tls" {
 		var icmp chan string
 		if m.Kind == "tcp" {
 			// TCP loss can be a TSPU block rather than a dead server: check ICMP
@@ -704,7 +759,7 @@ func (r *Runner) Check(parent context.Context, t model.Task, o model.Observation
 		}
 		dialStart := time.Now()
 		dialer := r.path.dialer(time.Duration(m.Timeout) * time.Second)
-		conn, e := dialer.DialContext(ctx, "tcp", net.JoinHostPort(address, fmt.Sprint(m.Port)))
+		conn, e := dialAny(ctx, dialer, dialTargets(ips, strconv.Itoa(m.Port)))
 		if m.Kind == "tcp" {
 			v.Latency = float64(time.Since(dialStart).Microseconds()) / 1000
 			latencySet = true
@@ -722,49 +777,46 @@ func (r *Runner) Check(parent context.Context, t model.Task, o model.Observation
 			}
 			return finish("down", "tcp")
 		}
-		conn.Close()
 		v.Network = "up"
-		if m.Kind == "tcp" {
+		if m.Kind != "tls" {
+			conn.Close()
+			if m.Kind == "tcp" {
+				return finish("up", "")
+			}
+		} else {
+			serverName := strings.TrimSpace(m.ServerName)
+			if serverName == "" {
+				serverName = address
+			}
+			tlsConn := tls.Client(conn, &tls.Config{
+				ServerName: serverName,
+				RootCAs:    r.roots,
+				MinVersion: tls.VersionTLS12,
+			})
+			if e = tlsConn.HandshakeContext(ctx); e != nil {
+				conn.Close()
+				v.Errno = errorCode(e)
+				if tlsVerificationError(e) {
+					return finish("down", "tls_verify")
+				}
+				return finish("down", "tls_handshake")
+			}
+			state := tlsConn.ConnectionState()
+			if len(state.VerifiedChains) > 0 && len(state.VerifiedChains[0]) > 0 {
+				v.TLSExpires = state.VerifiedChains[0][0].NotAfter.Unix()
+			} else if len(state.PeerCertificates) > 0 {
+				v.TLSExpires = state.VerifiedChains[0][0].NotAfter.Unix()
+			}
+			tlsConn.Close()
 			return finish("up", "")
 		}
 	}
-	if m.Kind == "tls" {
-		dialer := r.path.dialer(time.Duration(m.Timeout) * time.Second)
-		conn, e := dialer.DialContext(ctx, "tcp", net.JoinHostPort(address, fmt.Sprint(m.Port)))
-		if e != nil {
-			v.Network = "down"
-			v.Errno = errorCode(e)
-			return finish("down", "tcp")
-		}
-		v.Network = "up"
-		serverName := strings.TrimSpace(m.ServerName)
-		if serverName == "" {
-			serverName = address
-		}
-		tlsConn := tls.Client(conn, &tls.Config{
-			ServerName: serverName,
-			RootCAs:    r.roots,
-			MinVersion: tls.VersionTLS12,
-		})
-		if e = tlsConn.HandshakeContext(ctx); e != nil {
-			conn.Close()
-			v.Errno = errorCode(e)
-			if tlsVerificationError(e) {
-				return finish("down", "tls_verify")
-			}
-			return finish("down", "tls_handshake")
-		}
-		state := tlsConn.ConnectionState()
-		if len(state.VerifiedChains) > 0 && len(state.VerifiedChains[0]) > 0 {
-			v.TLSExpires = state.VerifiedChains[0][0].NotAfter.Unix()
-		} else if len(state.PeerCertificates) > 0 {
-			v.TLSExpires = state.PeerCertificates[0].NotAfter.Unix()
-		}
-		tlsConn.Close()
-		return finish("up", "")
-	}
 	if m.Kind == "http" {
 		if !allowedURL(m.URL, r.Config.Development) {
+			return finish("configuration_error", "configuration_error")
+		}
+		u, e := url.Parse(m.URL)
+		if e != nil {
 			return finish("configuration_error", "configuration_error")
 		}
 		client := r.boundClient(r.path, time.Duration(m.Timeout)*time.Second)
@@ -772,6 +824,22 @@ func (r *Runner) Check(parent context.Context, t model.Task, o model.Observation
 			client = directClient(time.Duration(m.Timeout) * time.Second)
 		}
 		defer client.CloseIdleConnections()
+		// The transport would look the URL host up again, so the request time would
+		// carry a resolver round trip on top of the network round trip.
+		port := u.Port()
+		if port == "" {
+			port = "80"
+			if strings.EqualFold(u.Scheme, "https") {
+				port = "443"
+			}
+		}
+		targets := dialTargets(ips, port)
+		dialer := r.path.dialer(5 * time.Second)
+		if tr, ok := client.Transport.(*http.Transport); ok {
+			tr.DialContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return dialAny(ctx, dialer, targets)
+			}
+		}
 		req, e := http.NewRequestWithContext(ctx, "GET", m.URL, nil)
 		if e != nil {
 			return finish("configuration_error", "configuration_error")

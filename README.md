@@ -6,7 +6,7 @@
     <img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="MIT License">
     <img src="https://img.shields.io/badge/Language-Bash-4EAA25.svg?logo=gnu-bash&logoColor=white" alt="Bash">
     <img src="https://img.shields.io/badge/Tech-Docker-2496ED.svg?logo=docker&logoColor=white" alt="Docker">
-    <img src="https://img.shields.io/badge/Release-v1.1.2-blueviolet.svg" alt="Version">
+    <img src="https://img.shields.io/badge/Release-v1.1.3-blueviolet.svg" alt="Version">
   </p>
   <p><strong>English</strong> / <a href="README.ru.md">Русский</a></p>
 </div>
@@ -35,7 +35,7 @@ and the settings stay in `C:\Users\<you>\AppData\Local\MeowProbe\probe.json`.
 ### Linux (.deb)
 
 ```bash
-sudo dpkg -i meow-zond_1.1.2_amd64.deb
+sudo dpkg -i meow-zond_1.1.3_amd64.deb
 meow-zond                       # connect the probe and keep it in the menu
 sudo meow-zond -install-service # or as root: background service with autostart
 ```

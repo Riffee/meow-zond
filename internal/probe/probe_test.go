@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"meowzond/internal/model"
@@ -19,6 +20,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -256,5 +258,151 @@ func TestTLSMonitorAndCertificateCheck(t *testing.T) {
 	v = runner.Check(context.Background(), task, observation)
 	if v.Outcome != "down" || v.Stage != "tls_verify" {
 		t.Fatalf("untrusted TLS must fail verification: %+v", v)
+	}
+}
+
+// fixedDNS answers A queries with 127.0.0.1 after a delay and counts the A lookups,
+// so a check that resolves the target twice cannot hide it.
+type fixedDNS struct {
+	conn    *net.UDPConn
+	delay   time.Duration
+	mu      sync.Mutex
+	lookups int
+}
+
+func (d *fixedDNS) count() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.lookups
+}
+
+func (d *fixedDNS) serve() {
+	buffer := make([]byte, 512)
+	for {
+		size, from, e := d.conn.ReadFromUDP(buffer)
+		if e != nil {
+			return
+		}
+		packet := append([]byte(nil), buffer[:size]...)
+		question, kind := dnsQuestion(packet)
+		if question == nil {
+			continue
+		}
+		if kind == 1 {
+			d.mu.Lock()
+			d.lookups++
+			d.mu.Unlock()
+		}
+		go func() {
+			time.Sleep(d.delay)
+			_, _ = d.conn.WriteToUDP(dnsAnswer(packet, question, kind), from)
+		}()
+	}
+}
+
+func dnsQuestion(packet []byte) ([]byte, uint16) {
+	if len(packet) < 16 {
+		return nil, 0
+	}
+	i := 12
+	for i < len(packet) {
+		length := int(packet[i])
+		if length == 0 {
+			i++
+			break
+		}
+		if length&0xc0 != 0 {
+			i += 2
+			break
+		}
+		i += 1 + length
+	}
+	if i+4 > len(packet) {
+		return nil, 0
+	}
+	return packet[12 : i+4], binary.BigEndian.Uint16(packet[i : i+2])
+}
+
+func dnsAnswer(packet []byte, question []byte, kind uint16) []byte {
+	var answers byte
+	if kind == 1 {
+		answers = 1
+	}
+	reply := append([]byte{packet[0], packet[1], 0x81, 0x80, 0x00, 0x01, answers, 0, 0, 0, 0, 0}, question...)
+	if kind == 1 {
+		reply = append(reply, 0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x05, 0x00, 0x04, 127, 0, 0, 1)
+	}
+	return reply
+}
+
+// TestLatencyNeverIncludesNameResolving pins the resolver to a 90 ms answer so a
+// second lookup inside the timed region would be impossible to miss.
+func TestLatencyNeverIncludesNameResolving(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the stub resolver and the POSIX ping stub are Linux only")
+	}
+	dir := t.TempDir()
+	if e := os.WriteFile(filepath.Join(dir, "ping"), []byte("#!/bin/sh\nexit 0\n"), 0755); e != nil {
+		t.Fatal(e)
+	}
+	t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
+
+	udp, e := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer udp.Close()
+	resolver := &fixedDNS{conn: udp, delay: 90 * time.Millisecond}
+	go resolver.serve()
+	previous := net.DefaultResolver
+	net.DefaultResolver = &net.Resolver{PreferGo: true, Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+		var dialer net.Dialer
+		return dialer.DialContext(ctx, "udp", udp.LocalAddr().String())
+	}}
+	defer func() { net.DefaultResolver = previous }()
+
+	listener, e := net.Listen("tcp", "127.0.0.1:0")
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer listener.Close()
+	go func() {
+		for {
+			conn, e := listener.Accept()
+			if e != nil {
+				return
+			}
+			conn.Close()
+		}
+	}()
+	port := listener.Addr().(*net.TCPAddr).Port
+
+	runner := &Runner{}
+	observation := model.Observation{Healthy: true, Direct: true}
+	task := func(m model.Monitor) model.Task {
+		m.Timeout = 5
+		return model.Task{Monitor: m, Expires: time.Now().Add(time.Minute).Unix()}
+	}
+	v := runner.Check(context.Background(), task(model.Monitor{Kind: "tcp", Address: "node.example", Port: port}), observation)
+	if v.Outcome != "up" {
+		t.Fatalf("the pinned answer must reach the listener: %+v", v)
+	}
+	if v.Latency > 60 {
+		t.Fatalf("a resolver round trip leaked into the TCP latency: %v ms", v.Latency)
+	}
+	if got := resolver.count(); got != 1 {
+		t.Fatalf("the name must be resolved once, got %d lookups", got)
+	}
+
+	v = runner.Check(context.Background(), task(model.Monitor{Kind: "tls", Address: "node.example", Port: port}), observation)
+	if v.Stage != "tls_handshake" {
+		t.Fatalf("the connection must reach the listener before the handshake fails: %+v", v)
+	}
+	v = runner.Check(context.Background(), task(model.Monitor{Kind: "http", URL: fmt.Sprintf("https://node.example:%d/", port)}), observation)
+	if v.Stage != "proxy_request" {
+		t.Fatalf("the request must reach the listener before it fails: %+v", v)
+	}
+	if got := resolver.count(); got != 3 {
+		t.Fatalf("tls and http must reuse the resolved address too, got %d lookups in total", got)
 	}
 }
