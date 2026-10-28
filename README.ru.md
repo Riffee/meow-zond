@@ -6,7 +6,7 @@
     <img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="MIT License">
     <img src="https://img.shields.io/badge/Language-Bash-4EAA25.svg?logo=gnu-bash&logoColor=white" alt="Bash">
     <img src="https://img.shields.io/badge/Tech-Docker-2496ED.svg?logo=docker&logoColor=white" alt="Docker">
-    <img src="https://img.shields.io/badge/Release-v1.1.0-blueviolet.svg" alt="Version">
+    <img src="https://img.shields.io/badge/Release-v1.1.1-blueviolet.svg" alt="Version">
   </p>
   <p><a href="README.md">English</a> / <strong>Русский</strong></p>
 </div>
@@ -35,13 +35,15 @@
 ### Linux (.deb)
 
 ```bash
-sudo dpkg -i meow-zond_1.1.0_amd64.deb
+sudo dpkg -i meow-zond_1.1.1_amd64.deb
 meow-zond                       # подключить зонд и работать через меню
 sudo meow-zond -install-service # либо фоновая служба с автозапуском
 ```
 
 Пакет ставит `/usr/bin/meow-zond`, пиктограмму логотипа, пункт меню и
-**выключенную** службу systemd, поэтому ничего само не стартует:
+**выключенную** службу systemd, поэтому ничего само не стартует. Сначала
+подключите зонд: пока `/var/lib/meow-zond/probe.json` нет, служба остаётся
+выключенной и не перезапускается на пустых настройках:
 
 ```bash
 sudo systemctl enable --now meow-zond   # запустить и оставить с автозапуском

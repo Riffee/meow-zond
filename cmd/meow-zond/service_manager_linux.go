@@ -257,6 +257,9 @@ Description=meow! status — сетевой зонд
 Documentation=https://github.com/Riffee/meow-zond
 After=network-online.target
 Wants=network-online.target
+# Stay inactive until the probe is connected: the packaged unit ships disabled
+# and has no settings file yet, so a start would only restart-loop.
+ConditionPathExists=%s
 
 [Service]
 Type=simple
@@ -275,7 +278,7 @@ RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 
 [Install]
 WantedBy=multi-user.target
-`, exe, config)
+`, config, exe, config)
 	if e := os.MkdirAll(serviceEtcDir, 0755); e != nil {
 		return fmt.Errorf("не удалось создать %s: %w", serviceEtcDir, e)
 	}

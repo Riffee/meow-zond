@@ -3,6 +3,9 @@ Description=meow! status — сетевой зонд
 Documentation=https://github.com/Riffee/meow-zond
 After=network-online.target
 Wants=network-online.target
+# Stay inactive until the probe is connected: the packaged unit ships disabled
+# and has no settings file yet, so a start would only restart-loop.
+ConditionPathExists=/var/lib/meow-zond/probe.json
 
 [Service]
 Type=simple

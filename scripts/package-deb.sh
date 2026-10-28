@@ -71,7 +71,7 @@ if [ -d /run/systemd/system ]; then
   systemctl daemon-reload || true
 fi
 echo "Зонд: /usr/bin/meow-zond (запуск без параметров — меню и подключение)."
-echo "Фоновая служба пока выключена: sudo systemctl enable --now meow-zond"
+echo "Фоновая служба пока выключена: сначала подключите зонд (meow-zond), затем sudo systemctl enable --now meow-zond"
 EOF
 cat > "$PKG/DEBIAN/prerm" <<'EOF'
 #!/bin/sh
