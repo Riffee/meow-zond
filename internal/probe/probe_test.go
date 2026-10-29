@@ -25,6 +25,39 @@ import (
 	"time"
 )
 
+func TestRenameKeepsTokenAndExplainsRevocation(t *testing.T) {
+	var gotPath, gotAuth, gotName string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotAuth = r.Header.Get("Authorization")
+		var body struct {
+			Name string `json:"name"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		gotName = body.Name
+		if r.Header.Get("Authorization") == "Bearer deleted."+strings.Repeat("t", 64) {
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"error":"Зонд не найден или доступ отозван"}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"probe_id":"probe","probe_name":"Новое имя"}`))
+	}))
+	defer server.Close()
+	c := Config{Server: server.URL, ProbeID: "probe", Token: strings.Repeat("t", 64), Development: true}
+	if e := Rename(context.Background(), c, "  Новое имя  "); e != nil {
+		t.Fatal(e)
+	}
+	if gotPath != "/api/probe/name" || gotAuth != "Bearer probe."+strings.Repeat("t", 64) || gotName != "Новое имя" {
+		t.Fatalf("unexpected rename request: path=%q auth=%q name=%q", gotPath, gotAuth, gotName)
+	}
+	c.ProbeID = "deleted"
+	e := Rename(context.Background(), c, "Новое имя")
+	if !IsUnauthorized(e) {
+		t.Fatalf("deleted probe must map to unauthorized, got %v", e)
+	}
+}
+
 func TestHTTPAndControlFailures(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, "expected") }))
 	defer server.Close()

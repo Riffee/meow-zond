@@ -48,11 +48,31 @@ type Config struct {
 }
 
 type RuntimeStatus struct {
-	Connected   bool              `json:"connected"`
-	LastContact int64             `json:"last_contact"`
-	LastError   string            `json:"last_error,omitempty"`
-	Observation model.Observation `json:"observation"`
-	Pending     int               `json:"pending"`
+	Connected    bool              `json:"connected"`
+	Unauthorized bool              `json:"unauthorized,omitempty"`
+	LastContact  int64             `json:"last_contact"`
+	LastError    string            `json:"last_error,omitempty"`
+	Observation  model.Observation `json:"observation"`
+	Pending      int               `json:"pending"`
+}
+
+// APIError keeps the status code so the console can tell a temporary network
+// problem from a probe that was deleted or revoked in the panel.
+type APIError struct {
+	Status  int
+	Message string
+}
+
+func (e *APIError) Error() string {
+	if strings.TrimSpace(e.Message) != "" {
+		return e.Message
+	}
+	return fmt.Sprintf("backend HTTP %d", e.Status)
+}
+
+func IsUnauthorized(err error) bool {
+	var api *APIError
+	return errors.As(err, &api) && (api.Status == http.StatusUnauthorized || api.Status == http.StatusForbidden)
 }
 
 type Runner struct {
@@ -187,6 +207,47 @@ func Register(ctx context.Context, server, name string) (Config, error) {
 	}, nil
 }
 
+// Rename changes the name the panel shows while keeping the probe id, token and
+// all monitor assignments. It fails with APIError 401 after the probe was
+// deleted or revoked, which the console turns into a fresh registration offer.
+func Rename(ctx context.Context, c Config, name string) error {
+	name = strings.TrimSpace(name)
+	if name == "" || len(name) > 100 {
+		return fmt.Errorf("укажите имя зонда")
+	}
+	server := strings.TrimRight(strings.TrimSpace(c.Server), "/")
+	if !serverURLAllowed(server, c.Development) || c.ProbeID == "" || len(c.Token) < 32 {
+		return fmt.Errorf("сначала подключите зонд")
+	}
+	body, _ := json.Marshal(map[string]string{"name": name, "platform": runtime.GOOS + "/" + runtime.GOARCH})
+	reqCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	req, e := http.NewRequestWithContext(reqCtx, "POST", server+"/api/probe/name", bytes.NewReader(body))
+	if e != nil {
+		return e
+	}
+	req.Header.Set("Authorization", "Bearer "+c.ProbeID+"."+c.Token)
+	req.Header.Set("Content-Type", "application/json")
+	client := directClient(20 * time.Second)
+	defer client.CloseIdleConnections()
+	resp, e := client.Do(req)
+	if e != nil {
+		return fmt.Errorf("не удалось связаться со статус-страницей: проверьте интернет")
+	}
+	defer resp.Body.Close()
+	var out struct {
+		Error string `json:"error"`
+	}
+	_ = json.NewDecoder(io.LimitReader(resp.Body, 8192)).Decode(&out)
+	if resp.StatusCode == http.StatusOK {
+		return nil
+	}
+	if strings.TrimSpace(out.Error) == "" {
+		out.Error = fmt.Sprintf("сервер отклонил смену имени (HTTP %d)", resp.StatusCode)
+	}
+	return &APIError{Status: resp.StatusCode, Message: out.Error}
+}
+
 func serverURLAllowed(raw string, dev bool) bool {
 	u, e := url.Parse(raw)
 	if e != nil || u.Host == "" || u.User != nil {
@@ -258,7 +319,11 @@ func (r *Runner) api(ctx context.Context, path string, in, out any) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
-		return fmt.Errorf("backend HTTP %d", resp.StatusCode)
+		var failure struct {
+			Error string `json:"error"`
+		}
+		_ = json.NewDecoder(io.LimitReader(resp.Body, 8192)).Decode(&failure)
+		return &APIError{Status: resp.StatusCode, Message: strings.TrimSpace(failure.Error)}
 	}
 	return json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(out)
 }
@@ -341,6 +406,7 @@ func (r *Runner) Step(ctx context.Context) error {
 	if e := r.step(ctx); e != nil {
 		r.statusMu.Lock()
 		r.status.Connected = false
+		r.status.Unauthorized = IsUnauthorized(e)
 		r.status.LastError = e.Error()
 		r.status.Pending = len(r.pending)
 		r.statusMu.Unlock()

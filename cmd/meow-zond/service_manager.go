@@ -158,15 +158,13 @@ func serviceSummary(st serviceStatus) string {
 	}
 }
 
-func printServiceSummary() {
+func serviceSummaryFrame() []string {
 	if !serviceSupported() {
-		return
+		return nil
 	}
-	fmt.Println()
 	st, e := currentServiceStatus()
 	if e != nil {
-		fmt.Println(paint(ansiMuted, "  Фоновую службу не удалось проверить: "+e.Error()))
-		return
+		return []string{paint(ansiMuted, "  Фоновую службу не удалось проверить: "+e.Error())}
 	}
 	note := serviceSummary(st)
 	if st.installed && st.state != "" {
@@ -179,10 +177,11 @@ func printServiceSummary() {
 	case st.installed && st.autostart:
 		color = ansiYellow
 	}
-	fmt.Println(paint(color, "  "+note))
+	lines := []string{paint(color, "  "+note)}
 	if st.installed {
-		fmt.Println(paint(ansiMuted, "  "+serviceStateText(st)))
+		lines = append(lines, paint(ansiMuted, "  "+serviceStateText(st)))
 	}
+	return lines
 }
 
 // serviceMenu keeps every service operation in one place. It returns the settings

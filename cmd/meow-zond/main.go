@@ -314,21 +314,91 @@ func rebind(p prompt, configPath string, c probe.Config) (probe.Config, bool, er
 	if e != nil {
 		return c, false, e
 	}
-	nc.Spool = c.Spool
-	nc.XrayPath = c.XrayPath
-	nc.XraySHA256 = c.XraySHA256
-	nc.IdentityURL = c.IdentityURL
-	if len(c.IdentityURLs) > 0 {
-		nc.IdentityURLs = c.IdentityURLs
-	}
-	if len(c.Controls) > 0 {
-		nc.Controls = c.Controls
-	}
-	nc.ExpectedInterface = c.ExpectedInterface
+	carryLocalSettings(c, &nc)
 	if e = probe.Save(configPath, nc); e != nil {
 		return nc, false, fmt.Errorf("адрес проверен, но настройки не сохранены: %w", e)
 	}
 	fmt.Println(paint(ansiGreen, "  Подключено: «"+displayName(nc)+"» → "+nc.Server))
+	return nc, true, nil
+}
+
+// carryLocalSettings keeps paths, control endpoints and the expected interface
+// when the probe is registered again, so only identity and server change.
+func carryLocalSettings(from probe.Config, to *probe.Config) {
+	to.Spool = from.Spool
+	to.XrayPath = from.XrayPath
+	to.XraySHA256 = from.XraySHA256
+	to.IdentityURL = from.IdentityURL
+	if len(from.IdentityURLs) > 0 {
+		to.IdentityURLs = from.IdentityURLs
+	}
+	if len(from.Controls) > 0 {
+		to.Controls = from.Controls
+	}
+	to.ExpectedInterface = from.ExpectedInterface
+}
+
+// renameProbe changes the name in place. If the panel no longer knows this
+// probe (the user deleted or revoked it), the same name is registered again and
+// the fresh token replaces the dead one instead of leaving the menu stuck with
+// "backend HTTP 401".
+func renameProbe(p prompt, configPath string, c probe.Config) (probe.Config, bool, error) {
+	fmt.Println()
+	fmt.Println(paint(ansiBold, "  Имя зонда"))
+	fmt.Println("  " + paint(ansiMuted, "сейчас: «"+displayName(c)+"»"))
+	entered, e := ask(p, "новое имя (Enter — отмена): ")
+	if e != nil {
+		return c, false, e
+	}
+	name := strings.TrimSpace(entered)
+	if name == "" {
+		fmt.Println(paint(ansiMuted, "  Отменено."))
+		return c, false, nil
+	}
+	if len(name) > 100 {
+		return c, false, fmt.Errorf("имя должно быть короче 100 символов")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if c.ProbeID == "" || len(c.Token) < 32 {
+		return registerAgain(ctx, configPath, c, name)
+	}
+	if e = probe.Rename(ctx, c, name); e != nil {
+		if !probe.IsUnauthorized(e) {
+			return c, false, e
+		}
+		fmt.Println("  " + paint(ansiYellow, "Панель больше не знает этот зонд: он удалён или доступ отозван."))
+		answer, e := ask(p, "Подключить заново с новым именем? (Y/n): ")
+		if e != nil {
+			return c, false, e
+		}
+		switch strings.ToLower(strings.TrimSpace(answer)) {
+		case "", "y", "yes", "д", "да":
+			return registerAgain(ctx, configPath, c, name)
+		default:
+			fmt.Println(paint(ansiMuted, "  Оставлено старое имя и старый доступ."))
+			return c, false, nil
+		}
+	}
+	c.ProbeName = name
+	if e = probe.Save(configPath, c); e != nil {
+		return c, false, fmt.Errorf("имя изменено на сервере, но не сохранено локально: %w", e)
+	}
+	fmt.Println(paint(ansiGreen, "  Теперь зонд называется «"+name+"»."))
+	return c, true, nil
+}
+
+func registerAgain(ctx context.Context, configPath string, c probe.Config, name string) (probe.Config, bool, error) {
+	nc, e := probe.Register(ctx, c.Server, name)
+	if e != nil {
+		return c, false, e
+	}
+	carryLocalSettings(c, &nc)
+	if e = probe.Save(configPath, nc); e != nil {
+		return nc, false, fmt.Errorf("зонд подключён, но настройки не сохранены: %w", e)
+	}
+	fmt.Println(paint(ansiGreen, "  Зонд зарегистрирован заново: «"+displayName(nc)+"» → "+nc.Server))
+	fmt.Println(paint(ansiMuted, "  Назначьте новый зонд мониторам в админке."))
 	return nc, true, nil
 }
 
@@ -397,7 +467,7 @@ func console(configPath string, c probe.Config, input *bufio.Reader) error {
 
 	start := func() error {
 		if serviceRunning() {
-			return errors.New("зонд уже работает как фоновая служба — остановите её в пункте 4")
+			return errors.New("зонд уже работает как фоновая служба — остановите её в пункте 5")
 		}
 		r, e := probe.New(c)
 		if e != nil {
@@ -410,21 +480,25 @@ func console(configPath string, c probe.Config, input *bufio.Reader) error {
 		return nil
 	}
 
-	draw := func() {
-		clearScreen()
-		printBanner(c, configPath)
-		if runner == nil {
-			printOffStatus(serviceRunning())
-		} else {
-			printRunnerStatus(runner)
+	lastFrame := -1
+	draw := func(refresh bool) {
+		frame := screenFrame(c, runner, notice, serviceSupported())
+		if refresh && len(frame) == lastFrame {
+			refreshScreen(frame)
+			return
 		}
-		printServiceSummary()
-		printNotice(notice)
-		printMenu(runner != nil, serviceSupported())
+		writeScreen(frame)
+		lastFrame = len(frame)
 	}
-	draw()
+	draw(false)
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
 	for {
 		select {
+		case <-ticker.C:
+			if !inputPending() {
+				draw(true)
+			}
 		case <-ctx.Done():
 			stop()
 			fmt.Println("\n" + paint(ansiMuted, "Зонд выключен."))
@@ -454,6 +528,31 @@ func console(configPath string, c probe.Config, input *bufio.Reader) error {
 				}
 			case "2":
 			case "3":
+				updated, changed, e := renameProbe(askLine, configPath, c)
+				if e != nil {
+					notice = paint(ansiRed, "Имя не изменено: "+e.Error())
+					break
+				}
+				if !changed {
+					break
+				}
+				keepLocalRunner := runner != nil
+				stop()
+				c = updated
+				if serviceInstalled() {
+					if e = applyServiceAction("sync-service", configPath); e != nil {
+						notice = paint(ansiRed, "Служба работает со старым именем: "+e.Error())
+						break
+					}
+					notice = paint(ansiGreen, "Служба получила новое имя и перезапущена.")
+					break
+				}
+				if keepLocalRunner {
+					if e = start(); e != nil {
+						notice = paint(ansiRed, "Не удалось включить зонд после смены имени: "+e.Error())
+					}
+				}
+			case "4":
 				updated, changed, e := rebind(askLine, configPath, c)
 				if e != nil {
 					notice = paint(ansiRed, "Адрес не изменён: "+e.Error())
@@ -478,7 +577,7 @@ func console(configPath string, c probe.Config, input *bufio.Reader) error {
 						notice = paint(ansiRed, "Не удалось включить зонд после смены адреса: "+e.Error())
 					}
 				}
-			case "4":
+			case "5":
 				updated := serviceMenu(askLine, configPath, c)
 				c = updated
 				if runner != nil && serviceRunning() {
@@ -487,11 +586,11 @@ func console(configPath string, c probe.Config, input *bufio.Reader) error {
 				}
 			case "0", "q", "exit":
 				stop()
-				fmt.Println(paint(ansiMuted, "Зонд выключен."))
+				fmt.Println("\n" + paint(ansiMuted, "Зонд выключен."))
 				return nil
 			case "":
 			}
-			draw()
+			draw(false)
 		}
 	}
 }
