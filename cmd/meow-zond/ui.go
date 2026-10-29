@@ -47,7 +47,11 @@ func rule(width int) string {
 }
 
 func label(value string) string {
-	return paint(ansiMuted, fmt.Sprintf("%-12s", value))
+	padding := 12 - utf8.RuneCountInString(value)
+	if padding < 1 {
+		padding = 1
+	}
+	return paint(ansiMuted, value+strings.Repeat(" ", padding))
 }
 
 // terminalSize returns the visible console window, not the scrollback buffer.
